@@ -19,6 +19,7 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 STATE_FILE = "state.json"
 LEVELS_URL = f"https://lab.flashalpha.com/v1/exposure/levels/{SYMBOL}"
+MAXPAIN_URL = f"https://lab.flashalpha.com/v1/maxpain/{SYMBOL}"
 TELEGRAM_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
 # 要监控的三条线：(展示名, state.json 中的字段名, levels 返回里的字段名)
@@ -64,6 +65,31 @@ def side(price: float, level: float) -> str:
     return "above" if price >= level else "below"
 
 
+def get_regime_context() -> str:
+    """
+    拉取 dealer gamma regime 作为背景参考，不改变触发逻辑，只丰富通知内容。
+    negative_gamma：做市商对冲顺势而为，突破更容易延续（信号相对更值得留意）
+    positive_gamma：做市商对冲逆势而为，突破容易被拉回（信号相对更弱，仅供参考）
+    拿不到时静默返回空字符串，不影响主流程。
+    """
+    try:
+        resp = requests.get(
+            MAXPAIN_URL,
+            headers={"X-Api-Key": FLASHALPHA_API_KEY},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        regime = data.get("regime")
+        if regime == "negative_gamma":
+            return "\n\n背景：当前 Negative Gamma（做市商顺势对冲，突破相对更容易延续，仅供参考，非交易建议）"
+        elif regime == "positive_gamma":
+            return "\n\n背景：当前 Positive Gamma（做市商逆势对冲，突破容易被拉回，仅供参考，非交易建议）"
+        return ""
+    except Exception:
+        return ""
+
+
 def main() -> None:
     if not in_market_hours():
         print("非交易时段，跳过本次执行。")
@@ -106,6 +132,7 @@ def main() -> None:
         text += f"\nGamma Flip: {levels.get('gamma_flip')}"
         text += f"\nCall Wall: {levels.get('call_wall')}"
         text += f"\nPut Wall: {levels.get('put_wall')}"
+        text += get_regime_context()
         send_telegram(text)
         print("已发送穿越通知:\n" + text)
     elif not prev_state:
