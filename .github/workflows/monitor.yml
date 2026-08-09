@@ -3,7 +3,12 @@ name: FlashAlpha Level Monitor
 on:
   schedule:
     - cron: "*/15 12-22 * * 1-5"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      force_run:
+        description: "强制测试（忽略交易时段限制，休市时手动测试用）"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -29,12 +34,17 @@ jobs:
           FLASHALPHA_API_KEY: ${{ secrets.FLASHALPHA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          FORCE_RUN: ${{ inputs.force_run }}
         run: python monitor.py
 
       - name: Commit updated state
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add state.json
-          git diff --cached --quiet || git commit -m "update state [skip ci]"
-          git push
+          if [ -f state.json ]; then
+            git add state.json
+            git diff --cached --quiet || git commit -m "update state [skip ci]"
+            git push
+          else
+            echo "state.json 未生成（可能是非交易时段被跳过），无需提交。"
+          fi
