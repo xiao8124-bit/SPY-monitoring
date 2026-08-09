@@ -31,7 +31,10 @@ WATCH_LEVELS = [
 
 
 def in_market_hours() -> bool:
-    """只在美股常规交易时段（含前后5分钟余量）内真正执行，其余时间直接跳过，避免无意义调用。"""
+    """只在美股常规交易时段（含前后5分钟余量）内真正执行，其余时间直接跳过，避免无意义调用。
+    设置环境变量 FORCE_RUN=true 可以绕过这个判断，方便休市时手动测试。"""
+    if os.environ.get("FORCE_RUN", "").lower() == "true":
+        return True
     now_et = datetime.now(ZoneInfo("America/New_York"))
     if now_et.weekday() >= 5:  # 周六=5, 周日=6
         return False
