@@ -11,6 +11,7 @@ FlashAlpha 关键点位/结构性指标监控 -> Telegram 推送
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
  
@@ -39,14 +40,26 @@ REGIME_LABEL = {
  
  
 def in_market_hours() -> bool:
+    """监控窗口收窄为 9:45-15:15 ET（避开开盘/收盘前后波动过大或数据不稳定的时段），
+    在这个窗口内最大化利用 Basic 套餐 250 次/日额度。"""
     if os.environ.get("FORCE_RUN", "").lower() == "true":
         return True
     now_et = datetime.now(ZoneInfo("America/New_York"))
     if now_et.weekday() >= 5:
         return False
-    start = now_et.replace(hour=9, minute=25, second=0, microsecond=0)
-    end = now_et.replace(hour=16, minute=5, second=0, microsecond=0)
+    start = now_et.replace(hour=9, minute=45, second=0, microsecond=0)
+    end = now_et.replace(hour=15, minute=15, second=0, microsecond=0)
     return start <= now_et <= end
+ 
+ 
+def seconds_until_window_close() -> float:
+    """距离 15:15 ET 收盘监控窗口还有多少秒，用于内部循环判断何时该提前退出。
+    强制测试模式下不受真实时间限制，返回一个足够大的数字方便测试循环逻辑。"""
+    if os.environ.get("FORCE_RUN", "").lower() == "true":
+        return 3600.0
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    end = now_et.replace(hour=15, minute=15, second=0, microsecond=0)
+    return (end - now_et).total_seconds()
  
  
 def today_et_str() -> str:
@@ -102,11 +115,8 @@ def is_top_oi_strike(mp_data: dict, strike: float, top_n: int = 5) -> bool:
     return strike in top_strikes
  
  
-def main() -> None:
-    if not in_market_hours():
-        print("非交易时段，跳过本次执行。")
-        return
- 
+def check_once() -> None:
+    """跑一次完整检查：拉数据、判断触发条件、按需推送 Telegram、更新 state.json。"""
     levels_data = fetch(LEVELS_URL)
     price = levels_data["underlying_price"]
     levels = levels_data["levels"]
@@ -276,9 +286,49 @@ def main() -> None:
     save_state(all_state)
  
  
+def main() -> None:
+    """
+    每次被 GitHub Actions 触发（cron 每 15 分钟一次）后，在这次触发内部循环检查，
+    每 POLL_INTERVAL_SECONDS（默认 180 秒 = 3 分钟）跑一次 check_once()，
+    循环持续 LOOP_DURATION_SECONDS（默认 780 秒 ≈ 13 分钟）或直到 15:15 ET 窗口关闭，
+    以先到者为准，之后自然退出，等下一次 15 分钟触发接力。
+    这样在不违反 GitHub Actions 5 分钟最短调度间隔的前提下，实际检查频率能做到 3 分钟一次。
+    """
+    if not in_market_hours():
+        print("非交易时段（窗口 9:45-15:15 ET），跳过本次触发。")
+        return
+ 
+    poll_interval = float(os.environ.get("POLL_INTERVAL_SECONDS", "180"))
+    loop_duration = float(os.environ.get("LOOP_DURATION_SECONDS", "780"))
+ 
+    loop_start = time.monotonic()
+    iteration = 0
+    while True:
+        iteration += 1
+        elapsed = time.monotonic() - loop_start
+        remaining_in_window = seconds_until_window_close()
+ 
+        if elapsed >= loop_duration:
+            print(f"已达单次触发内部循环上限（{loop_duration:.0f}秒），退出，等待下一次 cron 触发。")
+            break
+        if remaining_in_window <= 0:
+            print("已到 15:15 ET 窗口关闭时间，退出。")
+            break
+ 
+        print(f"---- 第 {iteration} 次检查 ----")
+        check_once()
+ 
+        # 计算下一次检查前还能不能再等一个 poll_interval，不能就直接退出，避免在窗口边缘空转
+        if elapsed + poll_interval >= loop_duration or remaining_in_window <= poll_interval:
+            print("下一次检查将超出循环时间上限或窗口关闭时间，提前结束本次触发。")
+            break
+        time.sleep(poll_interval)
+ 
+ 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
         print(f"运行出错: {e}", file=sys.stderr)
         raise
+ 
