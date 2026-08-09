@@ -1,42 +1,48 @@
 name: FlashAlpha Level Monitor
-
+ 
 on:
   schedule:
-    - cron: "*/15 12-22 * * 1-5"
+    # UTC 13:00-20:59，每 15 分钟触发一次外层任务
+    # 覆盖 9:45-15:15 ET 在夏令时(EDT, UTC-4)和冬令时(EST, UTC-5)下的全部范围
+    # 脚本内部会精确判断是否在窗口内，并在窗口内以 POLL_INTERVAL_SECONDS 为间隔循环检查
+    - cron: "*/15 13-20 * * 1-5"
   workflow_dispatch:
     inputs:
       force_run:
         description: "强制测试（忽略交易时段限制，休市时手动测试用）"
         type: boolean
         default: false
-
+ 
 permissions:
   contents: write
-
+ 
 jobs:
   monitor:
     runs-on: ubuntu-latest
+    timeout-minutes: 14  # 安全上限，略小于15分钟的触发间隔，避免和下一次触发重叠
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
+ 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
+ 
       - name: Install dependencies
         run: pip install -r requirements.txt
-
-      - name: Run monitor
+ 
+      - name: Run monitor (internal loop, ~3min cadence)
         env:
           SYMBOL: SPY
           FLASHALPHA_API_KEY: ${{ secrets.FLASHALPHA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FORCE_RUN: ${{ inputs.force_run }}
+          POLL_INTERVAL_SECONDS: "180"
+          LOOP_DURATION_SECONDS: "780"
         run: python monitor.py
-
+ 
       - name: Commit updated state
         run: |
           git config user.name "github-actions[bot]"
@@ -48,3 +54,4 @@ jobs:
           else
             echo "state.json 未生成（可能是非交易时段被跳过），无需提交。"
           fi
+ 
