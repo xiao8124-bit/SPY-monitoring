@@ -1,10 +1,10 @@
 {
   "SPY": {
-    "underlying_price": 772.16,
-    "as_of": "2026-08-12T14:57:30.5457836Z",
+    "underlying_price": 772.095,
+    "as_of": "2026-08-12T15:12:31.7692248Z",
     "date": "2026-08-12",
     "gamma_flip": "above",
-    "gamma_flip_value": 771.939582561842,
+    "gamma_flip_value": 771.874351049849,
     "call_wall": "below",
     "call_wall_value": 775,
     "put_wall": "above",
