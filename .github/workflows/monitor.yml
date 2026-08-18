@@ -2,9 +2,7 @@ name: FlashAlpha Level Monitor
  
 on:
   schedule:
-    # UTC 13:00-20:59，每 15 分钟触发一次外层任务
-    # 覆盖 9:45-15:15 ET 在夏令时(EDT, UTC-4)和冬令时(EST, UTC-5)下的全部范围
-    # 脚本内部会精确判断是否在窗口内，并在窗口内以 POLL_INTERVAL_SECONDS 为间隔循环检查
+    # 备用保险：GitHub 自带 schedule（不完全可靠，主力靠 cron-job.org 外部触发 workflow_dispatch）
     - cron: "*/15 13-20 * * 1-5"
   workflow_dispatch:
     inputs:
@@ -19,7 +17,7 @@ permissions:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 14  # 安全上限，略小于15分钟的触发间隔，避免和下一次触发重叠
+    timeout-minutes: 14
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,15 +30,19 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
  
-      - name: Run monitor (internal loop, ~3min cadence)
+      - name: Run monitor (internal loop, ~3.3min cadence)
         env:
           SYMBOL: SPY
           FLASHALPHA_API_KEY: ${{ secrets.FLASHALPHA_API_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           FORCE_RUN: ${{ inputs.force_run }}
-          POLL_INTERVAL_SECONDS: "180"
+          POLL_INTERVAL_SECONDS: "200"
           LOOP_DURATION_SECONDS: "780"
+          MOMENTUM_THRESHOLD_PCT: "0.2"
+          CONTINUATION_THRESHOLD_PCT: "0.2"
+          GAMMA_FLIP_BUFFER: "0.15"
+          COOLDOWN_MINUTES: "15"
         run: python monitor.py
  
       - name: Commit updated state
@@ -54,4 +56,3 @@ jobs:
           else
             echo "state.json 未生成（可能是非交易时段被跳过），无需提交。"
           fi
- 
