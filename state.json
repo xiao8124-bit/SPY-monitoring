@@ -1,12 +1,12 @@
 {
   "SPY": {
-    "underlying_price": 771.59,
-    "as_of": "2026-08-19T16:10:30.5543794Z",
+    "underlying_price": 771.41,
+    "as_of": "2026-08-19T16:25:25.506914Z",
     "date": "2026-08-19",
     "gamma_flip": "below",
-    "gamma_flip_value": 771.596773801114,
+    "gamma_flip_value": 771.418487755909,
     "call_wall": "below",
-    "call_wall_value": 773,
+    "call_wall_value": 775,
     "put_wall": "above",
     "put_wall_value": 769,
     "regime": "negative_gamma",
@@ -18,7 +18,7 @@
     "pivot_price": 771.395,
     "last_fired": {
       "momentum": "2026-08-19T10:55:25.374415-04:00",
-      "regime": "2026-08-19T11:18:39.456447-04:00",
+      "regime": "2026-08-19T12:18:42.546964-04:00",
       "gamma_flip": "2026-08-19T11:33:42.665457-04:00"
     }
   }
