@@ -1,14 +1,14 @@
 {
   "SPY": {
-    "underlying_price": 772.605,
-    "as_of": "2026-08-28T14:40:28.6455382Z",
+    "underlying_price": 774.475,
+    "as_of": "2026-08-28T14:55:25.1647538Z",
     "date": "2026-08-28",
     "gamma_flip": "above",
-    "gamma_flip_value": 771.553321023236,
+    "gamma_flip_value": 773.474954207441,
     "call_wall": "below",
     "call_wall_value": 775,
     "put_wall": "above",
-    "put_wall_value": 770,
+    "put_wall_value": 765,
     "regime": "positive_gamma",
     "em_anchor": 771.785,
     "em_upper": 820.5849999999999,
@@ -19,14 +19,16 @@
         "level": "Gamma Flip",
         "direction": "up",
         "break_price": 772.605,
-        "fired": false,
+        "fired": true,
         "break_time": "2026-08-28T10:40:28.454053-04:00"
       }
     ],
-    "pivot_price": 771.785,
+    "pivot_price": 773.41,
     "last_fired": {
       "gamma_flip": "2026-08-28T10:40:28.454053-04:00",
-      "regime": "2026-08-28T10:40:28.454053-04:00"
+      "regime": "2026-08-28T10:40:28.454053-04:00",
+      "momentum": "2026-08-28T10:45:19.468692-04:00",
+      "continuation_Gamma Flip_up": "2026-08-28T10:55:24.451525-04:00"
     }
   }
 }
