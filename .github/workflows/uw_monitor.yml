@@ -1,0 +1,102 @@
+name: UW SPY Monitor
+
+# 这是 Unusual Whales 版监控，与旧的 FlashAlpha 版（monitor.yml / monitor.py / state.json）完全独立，互不影响：
+#   - 脚本：uw_monitor.py        - 状态文件：uw_state.json        - 队列名：uw-monitor / uw-manual
+#
+# 触发方式：
+#   1) cron-job.org 每 15 分钟 POST 一次 workflow_dispatch（主触发，准点）
+#      网址：https://api.github.com/repos/<你的用户名>/<仓库名>/actions/workflows/uw_monitor.yml/dispatches
+#   2) 下面的 schedule 是 GitHub 自带定时器，只作“万一 cron-job.org 失效”的兜底（可能延迟几分钟）
+#   3) 在 Actions 页面手动 Run workflow，可选 mode：monitor / probe / telegram-test
+# 两个触发源同时存在也没问题：concurrency 保证同一时间只有 1 个监控任务在跑，多出来的排队任务会被自动取消。
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "运行模式：monitor=正常监控｜probe=探测 UW 接口并发到 Telegram｜telegram-test=只测试 Telegram 推送"
+        type: choice
+        options:
+          - monitor
+          - probe
+          - telegram-test
+        default: monitor
+      force_run:
+        description: "monitor 模式下，非交易时段也强制跑一轮（测试用，不保存状态）"
+        type: boolean
+        default: false
+  schedule:
+    # UTC 时间；13–21 点同时覆盖夏令时/冬令时的美股 9:30–16:00 ET，脚本内部会再精确判断时段
+    - cron: "7,22,37,52 13-21 * * 1-5"
+
+run-name: UW ${{ inputs.mode || 'monitor' }} · ${{ github.event_name }}
+
+permissions:
+  contents: write
+
+# 手动测试（probe / telegram-test）用单独的队列，不用等正在运行的监控任务
+concurrency:
+  group: ${{ (inputs.mode == 'probe' || inputs.mode == 'telegram-test') && 'uw-manual' || 'uw-monitor' }}
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      MODE: ${{ inputs.mode || 'monitor' }}
+      FORCE_RUN: ${{ inputs.force_run && '1' || '0' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        # 直接安装，不依赖仓库里旧版的 requirements.txt
+        run: pip install "requests>=2.31.0"
+
+      - name: Run monitor
+        timeout-minutes: 18
+        env:
+          PYTHONUNBUFFERED: "1"
+          UW_API_KEY: ${{ secrets.UW_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # 以下均为可选：在仓库 Settings → Secrets and variables → Actions → Variables 里新建同名变量即可调整，
+          # 不建就用脚本默认值（留空 = 默认）。
+          SYMBOL: ${{ vars.SYMBOL }}
+          PUSH_SINGLE: ${{ vars.PUSH_SINGLE }}
+          DAILY_PUSH_CAP: ${{ vars.DAILY_PUSH_CAP }}
+          RUN_PUSH_CAP: ${{ vars.RUN_PUSH_CAP }}
+          TIDE_Z: ${{ vars.TIDE_Z }}
+          PRINT_MIN_PREMIUM: ${{ vars.PRINT_MIN_PREMIUM }}
+          MEGA_PRINT_PREMIUM: ${{ vars.MEGA_PRINT_PREMIUM }}
+          IMPULSE_PCT: ${{ vars.IMPULSE_PCT }}
+          FLIP_BUFFER: ${{ vars.FLIP_BUFFER }}
+          WALL_BUFFER: ${{ vars.WALL_BUFFER }}
+          DEBUG: ${{ vars.DEBUG }}
+        run: python uw_monitor.py
+
+      - name: Save state
+        # 只有正常监控才保存状态；即使上一步出错/超时也尽量保存。只会提交 uw_state.json，不碰旧版的任何文件
+        if: ${{ always() && env.MODE == 'monitor' && env.FORCE_RUN != '1' }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ ! -f uw_state.json ]; then echo "没有状态文件，跳过"; exit 0; fi
+          git add uw_state.json
+          if git diff --cached --quiet; then echo "状态无变化"; exit 0; fi
+          git commit -m "chore: update UW monitor state [skip ci]"
+          for i in 1 2 3 4 5; do
+            if git pull --rebase origin "${GITHUB_REF_NAME}" && git push origin "HEAD:${GITHUB_REF_NAME}"; then
+              echo "状态已保存"; exit 0
+            fi
+            echo "第 $i 次推送失败，重试…"; sleep $((i * 3))
+          done
+          echo "::warning::状态文件保存失败（不影响本次推送，下一轮会重新积累）"
+          exit 0
