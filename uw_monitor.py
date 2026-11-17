@@ -43,10 +43,12 @@ ET = ZoneInfo("America/New_York")
 UTC = timezone.utc
 UW_BASE = "https://api.unusualwhales.com"
 TG_BASE = "https://api.telegram.org"
-STATE_VERSION = 3
+STATE_VERSION = 4
 STATE_FILE = os.environ.get("STATE_FILE", "uw_state.json")
 DISCLAIMER = "⚠ 描述性提示，非交易建议"
 SRC_LABEL = {"oi": "OI口径", "vol": "成交口径"}
+CAP_LABEL = {"quote": "实时价格", "state": "备用价格", "lv_primary": "点位(OI)", "lv_live": "点位(盘中)", "ticks": "净权利金",
+             "flow": "大单提醒", "greek": "日度Gamma", "strikes": "按行权价墙位", "ticks_prev": "前一日资金流基线"}
 
 # ----------------------------------------------------------------------------
 # 脱敏与日志
@@ -115,6 +117,14 @@ class Cfg:
         # 点位口径
         self.primary_src = s("PRIMARY_SOURCE", "oi").lower()
         self.live_src = s("LIVE_SOURCE", "vol").lower()
+        # 墙位算法：strike = 按行权价的 OI gamma 自己算"近端墙"（默认）；uw = 直接用 UW gex-levels 给的墙。
+        # 原因：UW 的 OI 口径 Put Wall 定义为"现价下方净 gamma 最大的行权价"，实测会落在 629（离现价 16%），盘中用不上；
+        # 按行权价算出的近端墙实测在现价下方 0.7%~1.3%、上方 1.4% 左右。取不到按行权价的数据时自动退回 UW 的墙。
+        self.wall_mode = s("WALL_MODE", "strike").lower()
+        self.strike_every = f("STRIKE_EVERY_SECONDS", 300)     # OI 日内基本不变，5 分钟刷新一次足够
+        self.strike_window_pct = f("STRIKE_WINDOW_PCT", 6.0)    # 只取现价 ±6% 内的行权价
+        self.wall_sig = f("WALL_SIGNIFICANCE", 0.6)             # 近端墙的 gamma 需 ≥ 同侧最大值的 60%
+        self.wall_roll_pct = f("WALL_ROLL_PCT", 0.5)            # 价格越过墙 0.5% 以上才换到下一道墙（期间仍按"已突破"处理）
 
         # 结构信号
         self.flip_buffer = f("FLIP_BUFFER", 0.20)             # Flip 区缓冲下限（美元）；实际会随波动自动放大
@@ -146,9 +156,9 @@ class Cfg:
         self.tide_min_ticks = int(f("TIDE_MIN_TICKS", 20))
         self.tide_open_guard = f("TIDE_OPEN_GUARD_MIN", 20)   # 开盘后头 N 分钟成交最密，只显示不触发资金流信号
         self.print_min = f("PRINT_MIN_PREMIUM", 250000)
-        # 实测 SPY 一天约 330 笔 ≥$25万 的大单提醒（中位数约 $50万）：10 分钟同向合计 $300 万~$600 万是家常便饭，
-        # 门槛定在 $1500 万，常规日约 1~2 次/天
-        self.print_burst = f("PRINT_BURST_PREMIUM", 15000000)
+        # 实测 SPY 一天约 330~390 笔 ≥$25万 的大单提醒（中位数约 $50万）：10 分钟同向合计 $300 万~$600 万是家常便饭。
+        # 真实回放：周一（偏活跃的下跌日）≥$1000 万 4 次、≥$1500 万 0 次；周五（清淡）≥$800 万 0 次 → 取 $1000 万，约 0~4 次/天
+        self.print_burst = f("PRINT_BURST_PREMIUM", 10000000)
         self.print_min_count = int(f("PRINT_MIN_COUNT", 3))
         self.print_dominance = f("PRINT_DOMINANCE", 3.0)
         self.print_window_min = f("PRINT_WINDOW_MIN", 10)
@@ -640,6 +650,48 @@ def compute_zone(lv, cfg: Cfg, buf=None):
     return {"center": flip, "lo": lo, "hi": hi, "low": lo - b, "high": hi + b, "n": len(cluster), "buf": b}
 
 
+def pick_walls(rows, spot, cfg: Cfg):
+    """按行权价的 OI gamma 选"近端墙"。
+    Call Wall：现价上方（含"已越过但不足 wall_roll_pct"的）call gamma 集中度 ≥ 同侧最大值×wall_sig、且为局部峰值的最近行权价；
+    Put Wall：对称。同时返回同侧"最大墙"（集中度最大的行权价）。数据不足返回 None；某一侧无候选则该侧为 None。
+    同一个行权价若同时被选为 Call Wall 和 Put Wall（价格被钉在大持仓行权价附近），它只算价格"另一侧"的那堵墙。
+    rows 来自 parse_strike_gamma：[{strike, c_oi, p_oi, ...}]（call gamma 为正、put gamma 为负，取绝对值比较）。"""
+    if not rows or not spot or len(rows) < 8:
+        return None
+    roll = cfg.wall_roll_pct / 100.0
+    pts_by = {kind: {r["strike"]: abs(r[key]) for r in rows if r.get(key) is not None}
+              for kind, key in (("call", "c_oi"), ("put", "p_oi"))}
+
+    def choose(kind, exclude=()):
+        pts = pts_by[kind]
+        order = sorted(pts)
+        if kind == "call":
+            cand = [k for k in order if k >= spot * (1 - roll) and pts[k] > 0 and k not in exclude]
+        else:
+            cand = [k for k in order if k <= spot * (1 + roll) and pts[k] > 0 and k not in exclude]
+        if not cand:
+            return None, None
+        kmax = max(cand, key=lambda k: pts[k])
+        gmax = pts[kmax]
+
+        def is_peak(k):
+            i = order.index(k)
+            nb = [pts[order[j]] for j in range(max(0, i - 2), min(len(order), i + 3)) if j != i]
+            return all(pts[k] >= x for x in nb)
+
+        sig = [k for k in cand if pts[k] >= cfg.wall_sig * gmax and is_peak(k)]
+        return ((min(sig) if kind == "call" else max(sig)) if sig else kmax), kmax
+
+    out = {}
+    for kind in ("call", "put"):
+        out[kind], out[kind + "_max"] = choose(kind)
+    if out["call"] is not None and out["call"] == out["put"]:
+        k = out["call"]
+        drop = "call" if spot >= k else "put"          # 价格在它上方 → 它是支撑（Put Wall）；在它下方 → 它是阻力（Call Wall）
+        out[drop], _ = choose(drop, exclude=(k,))
+    return out
+
+
 def is_rth(dt) -> bool:
     """是否在美股常规交易时段（9:30–16:00 ET）。UW 的资金流 tick 从 7:30 到 16:15，盘前盘后很清淡，不能混进波动基线。"""
     e = dt.astimezone(ET)
@@ -709,7 +761,7 @@ def new_state(date_str: str) -> dict:
         "v": STATE_VERSION, "date": date_str,
         "panel": {"message_id": None, "last_edit": None},
         "session": {"open": None, "high": None, "low": None, "first_t": None, "was_regular": False},
-        "pivot": None, "px_hist": [], "impulse_state": None, "breaks": [], "flip_cross_ts": [],
+        "pivot": None, "px_hist": [], "impulse_state": None, "breaks": [], "flip_cross_ts": [], "wall_cross_ts": {"call": [], "put": []},
         "zone": {"side": None, "pending": None, "last": None},
         "walls": {"call_ref": None, "put_ref": None, "pending": {"call": None, "put": None}},
         "broken": {"call": None, "put": None},
@@ -887,12 +939,24 @@ class Engine:
                     held = (now - parse_iso(pend["since"])).total_seconds()
                     if held >= cfg.wall_confirm_s:
                         ws["pending"][kind] = None
-                        self.s["broken"][kind] = {"level": lvl, "t": iso(now)}
                         name = "Call Wall" if kind == "call" else "Put Wall"
+                        # 震荡保护：同一墙位在 chop_window_min 分钟内被"确认突破"达到 chop_crosses 次 → 视为来回震荡
+                        ts = now.timestamp()
+                        wc = self.s.setdefault("wall_cross_ts", {"call": [], "put": []})
+                        allh = [x for x in wc.get(kind, []) if x[0] >= ts - cfg.chop_window_min * 60] + [[ts, lvl]]
+                        wc[kind] = allh
+                        tol = max(2 * buf, lvl * 0.0015)
+                        same = [x for x in allh if abs(x[1] - lvl) <= tol]
+                        chop = len(same) >= cfg.chop_crosses
+                        self.s["broken"][kind] = {"level": lvl, "t": iso(now), "chop": chop}
                         text = (f"{name} {lvl:.2f} {'向上突破' if d == 'up' else '向下跌破'}已确认"
                                 f"（现价 {P:.2f}，已越过 {abs(P - lvl):.2f}，持续 {held:.0f}秒）")
-                        self.add_event(now, "wall_break", d, text, P, level=lvl)
-                        self.register_break(now, d, lvl, name)
+                        if chop:
+                            text += (f"\n  ⚠ {cfg.chop_window_min:.0f}分钟内第{len(same)}次突破同一墙位，价格在墙位附近来回震荡，"
+                                     f"可靠性较低（不计入结构确认）")
+                        self.add_event(now, "wall_break", d, text, P, level=lvl, chop=chop)
+                        if not chop:
+                            self.register_break(now, d, lvl, name)
             br = self.s["broken"].get(kind)
             if br:
                 reclaimed = (P < br["level"] - buf) if kind == "call" else (P > br["level"] + buf)
@@ -1115,8 +1179,13 @@ class Engine:
         for kind, d in (("call", "up"), ("put", "down")):
             br = s["broken"].get(kind)
             if br:
-                out[d].append(("wall_break", f"{'Call' if kind == 'call' else 'Put'} Wall {br['level']:.2f} "
-                                             f"{'上破' if d == 'up' else '下破'}（{hm(parse_iso(br['t']))}确认，尚未收复）"))
+                ok = True
+                if br.get("chop"):                      # 震荡中的突破：只有价格已明显离开墙位才算
+                    P = self.view.get("P")
+                    ok = bool(P and ((P - br["level"]) if d == "up" else (br["level"] - P)) / P * 100 >= cfg.chop_clear_pct)
+                if ok:
+                    out[d].append(("wall_break", f"{'Call' if kind == 'call' else 'Put'} Wall {br['level']:.2f} "
+                                                 f"{'上破' if d == 'up' else '下破'}（{hm(parse_iso(br['t']))}确认，尚未收复）"))
         m = s["flags"].get("migration")
         if m:
             out[m["dir"]].append(("migration", f"盘中Flip{'上移' if m['dir'] == 'up' else '下移'} {m['df']:+.2f}"))
@@ -1207,7 +1276,7 @@ class Engine:
                 continue
             if d in conf_dirs:
                 continue
-            if kind == "flip_cross" and e.get("chop"):
+            if kind in ("flip_cross", "wall_break") and e.get("chop"):
                 continue
             want = False
             if cfg.push_single == "all" and kind in ("flip_cross", "wall_break", "impulse", "continuation", "milestone",
@@ -1229,14 +1298,13 @@ class Engine:
         if zone:
             rng = f"（区 {zone['lo']:.2f}–{zone['hi']:.2f}）" if zone["hi"] - zone["lo"] >= 0.01 else ""
             a.append(f"Flip {zone['center']:.2f}{rng}")
-        b = []
-        if prim.get("call") is not None:
-            b.append(f"Call Wall {prim['call']:.2f}（{prim['call'] - P:+.2f}）")
-        if prim.get("put") is not None:
-            b.append(f"Put Wall {prim['put']:.2f}（{prim['put'] - P:+.2f}）")
+        sm = v.get("wall_src") == "strike"
+        b = [wall_text(prim, k, P, sm) for k in ("call", "put") if prim.get(k) is not None]
         if prim.get("magnet") is not None:
             b.append(f"磁吸 {prim['magnet']:.2f}（{prim['magnet'] - P:+.2f}）")
         src = SRC_LABEL.get(self.cfg.primary_src, self.cfg.primary_src)
+        if sm:
+            src += "｜墙位=按行权价OI Gamma近端峰值"
         return "｜".join(a) + ("\n" + "｜".join(b) if b else "") + f"\n点位口径：{src}"
 
     def flow_status_text(self) -> str:
@@ -1357,7 +1425,7 @@ class Engine:
         closed = (not force) and mt is not None and mt != "regular"
         stale = (P is None) or (price_age is not None and price_age > cfg.stale_price_s and not closed and not force)
         self.view = {"P": P, "q": q, "price_age": price_age, "closed": closed, "stale": stale, "force": force,
-                     "prim": snap.get("primary"), "live": snap.get("live"), "tide": None, "prints": None,
+                     "prim": snap.get("primary"), "live": snap.get("live"), "wall_src": snap.get("wall_src"), "tide": None, "prints": None,
                      "caps": snap.get("caps", {})}
         expect_live = in_window(now, cfg) and not force
 
@@ -1419,6 +1487,16 @@ class Engine:
 # ----------------------------------------------------------------------------
 # 面板
 # ----------------------------------------------------------------------------
+def wall_text(prim: dict, key: str, P: float, strike_mode: bool) -> str:
+    """一行里的墙位：Call Wall 750.00（+9.76）；按行权价口径且"最大墙"离得较远时附带最大墙。"""
+    nm = "Call Wall" if key == "call" else "Put Wall"
+    t = f"{nm} {prim[key]:.2f}（{prim[key] - P:+.2f}）"
+    mx = prim.get(key + "_max")
+    if strike_mode and mx is not None and abs(mx - prim[key]) >= 0.5:
+        t += f"［最大墙 {mx:g}］"
+    return t
+
+
 def render_panel(eng: Engine, now) -> str:
     cfg, s, v = eng.cfg, eng.s, eng.view
     P = v.get("P")
@@ -1451,13 +1529,15 @@ def render_panel(eng: Engine, now) -> str:
     elif prim:
         L.append("Flip：无（净Gamma未穿零）")
     if prim and P is not None:
-        parts = []
-        if prim.get("call") is not None:
-            parts.append(f"Call Wall {prim['call']:.2f}（{prim['call'] - P:+.2f}）")
-        if prim.get("put") is not None:
-            parts.append(f"Put Wall {prim['put']:.2f}（{prim['put'] - P:+.2f}）")
+        sm = v.get("wall_src") == "strike"
+        parts = [wall_text(prim, k, P, sm) for k in ("call", "put") if prim.get(k) is not None]
         if parts:
             L.append("｜".join(parts))
+        if sm:
+            uw_c, uw_p = prim.get("call_uw"), prim.get("put_uw")
+            L.append(f"  墙位口径：按行权价 OI Gamma 取近端峰值（UW 自带：Call {fpx(uw_c)}／Put {fpx(uw_p)}）")
+        elif cfg.wall_mode == "strike":
+            L.append("  墙位口径：按行权价数据暂不可用，暂用 UW 自带的 Call/Put Wall")
         if prim.get("magnet") is not None:
             L.append(f"磁吸位 {prim['magnet']:.2f}（{prim['magnet'] - P:+.2f}）")
     elif not prim:
@@ -1465,7 +1545,8 @@ def render_panel(eng: Engine, now) -> str:
     for kind, nm in (("call", "Call Wall"), ("put", "Put Wall")):
         br = s["broken"].get(kind)
         if br:
-            L.append(f"已{'上破' if kind == 'call' else '下破'} {nm} {br['level']:.2f}（{hm(parse_iso(br['t']))}确认，未收复）")
+            L.append(f"已{'上破' if kind == 'call' else '下破'} {nm} {br['level']:.2f}（{hm(parse_iso(br['t']))}确认，未收复）"
+                     + ("｜⚠ 震荡中，暂不计入结构" if br.get("chop") else ""))
     if live and live is not prim and P is not None:
         m = s["flags"].get("migration")
         mt = f"｜Flip迁移 {m['df']:+.2f}" if m else ""
@@ -1533,7 +1614,7 @@ def render_panel(eng: Engine, now) -> str:
     caps = v.get("caps") or {}
     bad = [k for k, val in caps.items() if val]
     if bad:
-        L.append("⚠ 不可用接口：" + "、".join(bad))
+        L.append("⚠ 不可用接口：" + "、".join(CAP_LABEL.get(k, k) for k in bad))
     L.append(DISCLAIMER)
     return "\n".join(L)
 
@@ -1600,6 +1681,25 @@ class Fetcher:
             lv = self.fetch("lv_primary", f"/api/stock/{sym}/gex-levels", {"source": cfg.primary_src}, parse_levels, now)
             snap["fresh"]["primary"] = lv is not None
         snap["primary"] = self.cache.get("lv_primary")
+        snap["wall_src"] = "uw"
+        if cfg.wall_mode == "strike" and snap["primary"] is not None and "strikes" not in self.disabled:
+            px = qv["price"] if qv else (self.eng.view.get("P") or None)
+            if px:
+                if self.due("strikes", now, cfg.strike_every) or "strikes" not in self.cache:
+                    w = cfg.strike_window_pct / 100.0
+                    self.fetch("strikes", f"/api/stock/{sym}/spot-exposures/strike",
+                               {"limit": 500, "min_strike": int(px * (1 - w)), "max_strike": int(px * (1 + w)) + 1},
+                               parse_strike_gamma, now, retries=1)
+                pw = pick_walls(self.cache.get("strikes"), px, cfg)
+                if pw and (pw["call"] is not None or pw["put"] is not None):
+                    lv = dict(snap["primary"])
+                    lv["call_uw"], lv["put_uw"] = lv.get("call"), lv.get("put")
+                    for k in ("call", "put"):
+                        if pw[k] is not None:
+                            lv[k] = pw[k]
+                    lv["call_max"], lv["put_max"] = pw["call_max"], pw["put_max"]
+                    snap["primary"] = lv
+                    snap["wall_src"] = "strike"
         if cfg.live_src and cfg.live_src != cfg.primary_src:
             if self.due("lv_live", now, cfg.levels_every) or "lv_live" not in self.cache:
                 lv = self.fetch("lv_live", f"/api/stock/{sym}/gex-levels", {"source": cfg.live_src}, parse_levels, now)
@@ -1656,7 +1756,10 @@ class Fetcher:
         if self.fatal is not None:
             snap["notices"]["auth"] = f"UW API 访问失败（HTTP {self.fatal.status}：{self.fatal.err}）。请检查 UW_API_KEY 与订阅状态。"
         for k, v in self.disabled.items():
-            snap["notices"][f"cap_{k}"] = f"接口 {k} 不可用（{v}），相关信号已停用；其余功能不受影响。"
+            if k == "strikes":
+                snap["notices"]["cap_strikes"] = f"按行权价的墙位数据不可用（{v}），已改用 UW 自带的 Call/Put Wall（可能离现价较远）；其余功能不受影响。"
+            else:
+                snap["notices"][f"cap_{k}"] = f"接口 {k} 不可用（{v}），相关信号已停用；其余功能不受影响。"
         return snap
 
 
@@ -1921,15 +2024,18 @@ def _data_rows(raw) -> list:
 
 def parse_strike_gamma(raw):
     """/spot-exposures/strike → 按行权价升序的 [{strike, price, time, c_oi, p_oi, c_vol, p_vol}]；无可用行返回 None。"""
-    out = []
+    best, floor = {}, datetime.min.replace(tzinfo=UTC)
     for r in _data_rows(raw):
         k = num(r.get("strike"))
         if k is None:
             continue
-        out.append({"strike": k, "price": num(r.get("price")), "time": _any_ts(r.get("time")),
-                    "c_oi": num(r.get("call_gamma_oi")), "p_oi": num(r.get("put_gamma_oi")),
-                    "c_vol": num(r.get("call_gamma_vol")), "p_vol": num(r.get("put_gamma_vol"))})
-    out.sort(key=lambda x: x["strike"])
+        row = {"strike": k, "price": num(r.get("price")), "time": _any_ts(r.get("time")),
+               "c_oi": num(r.get("call_gamma_oi")), "p_oi": num(r.get("put_gamma_oi")),
+               "c_vol": num(r.get("call_gamma_vol")), "p_vol": num(r.get("put_gamma_vol"))}
+        old = best.get(k)
+        if old is None or (row["time"] or floor) >= (old["time"] or floor):     # 同一行权价若有多个时间点，只保留最新的
+            best[k] = row
+    out = sorted(best.values(), key=lambda x: x["strike"])
     return out or None
 
 
@@ -1941,7 +2047,7 @@ def strike_walls(rows, ref, key: str):
     return ups[:3], dns[:3]
 
 
-def strike_gamma_report(rows, spot=None) -> str:
+def strike_gamma_report(rows, spot=None, cfg=None, uw_levels=None) -> str:
     if not rows:
         return "ℹ️ 按行权价 gamma：无数据"
     prices = sorted(r["price"] for r in rows if r.get("price"))
@@ -1966,6 +2072,16 @@ def strike_gamma_report(rows, spot=None) -> str:
         ups, dns = strike_walls(rows, ref, key)
         L.append(f"   {name} Call Wall 前3：{fmt(ups)}")
         L.append(f"   {name} Put Wall 前3：{fmt(dns)}")
+    if cfg is not None:
+        pw = pick_walls(rows, spot or ref, cfg)
+        if pw:
+            def one(k):
+                return "无" if k is None else f"{k:g}({(k - ref) / ref * 100:+.1f}%)"
+            L.append(f"   ▶ 监控将使用的近端墙（OI口径）：Call {one(pw['call'])}｜Put {one(pw['put'])}｜最大墙 Call {one(pw['call_max'])}｜Put {one(pw['put_max'])}")
+        else:
+            L.append("   ▶ 近端墙：数据不足，监控将回退到 UW 自带的 Call/Put Wall")
+        if uw_levels:
+            L.append(f"   对照 UW 自带（OI口径）：Call {fpx(uw_levels.get('call'))}｜Put {fpx(uw_levels.get('put'))}")
     return "\n".join(L)
 
 
@@ -2029,7 +2145,7 @@ def sample_fields(raw, n: int = 16) -> str:
     return f"{len(rows)}行｜字段：" + ", ".join(list(rows[0].keys())[:n]) + ("…" if len(rows[0]) > n else "")
 
 
-def run_probe_extras(cfg: Cfg, uw: UW, price, now_u) -> list:
+def run_probe_extras(cfg: Cfg, uw: UW, price, now_u, uw_levels=None) -> list:
     """逐个检查扩展接口；每个接口独立 try，任何一个出错都不影响其余。返回要追加到报告里的行。"""
     sym = cfg.symbol
     out = []
@@ -2038,7 +2154,7 @@ def run_probe_extras(cfg: Cfg, uw: UW, price, now_u) -> list:
         p.update(min_strike=int(price * 0.94), max_strike=int(price * 1.06) + 1)
     specs = [
         ("按行权价 gamma", f"/api/stock/{sym}/spot-exposures/strike", p,
-         lambda r: strike_gamma_report(parse_strike_gamma(r), price)),
+         lambda r: strike_gamma_report(parse_strike_gamma(r), price, cfg, uw_levels)),
         ("分钟级 gamma 序列", f"/api/stock/{sym}/spot-exposures", None,
          lambda r: spot_series_report(parse_spot_series(r))),
         ("delta/vega 流向", f"/api/stock/{sym}/greek-flow", None,
@@ -2059,7 +2175,7 @@ def run_probe_extras(cfg: Cfg, uw: UW, price, now_u) -> list:
             out.append(txt if txt.startswith(("🧱", "📉", "🌊")) else f"✅ {name}｜{txt}")
         except Exception as e:  # noqa: BLE001
             out.append(f"⚠ {name} 解析异常 {type(e).__name__}")
-    out.insert(0, f"🧩 扩展接口检查（监控暂未使用，为后续功能做准备）｜{ok}/{len(specs)} 项可用")
+    out.insert(0, f"🧩 扩展接口检查（按行权价 gamma 用于计算墙位，其余为后续功能做准备）｜{ok}/{len(specs)} 项可用")
     return out
 
 
@@ -2070,6 +2186,7 @@ def run_probe(cfg: Cfg, uw: UW, tg: Telegram, now_fn=now_et) -> None:
     prev = prev_weekdays(today, 1)[0].isoformat()
     now_u = now.astimezone(UTC)
     probe_price = None
+    probe_levels = None
     tests = [
         ("quote", f"/api/stock/{sym}/quote", None),
         ("stock-state(备用价格)", f"/api/stock/{sym}/stock-state", None),
@@ -2108,6 +2225,8 @@ def run_probe(cfg: Cfg, uw: UW, tg: Telegram, now_fn=now_et) -> None:
                 info = f"price {q['price']}｜时间 {hmd(q['ts'])}" if q else "⚠ 解析不到价格（字段名可能不同）"
             elif name.startswith("gex-levels"):
                 lv = parse_levels(r.data)
+                if lv and name == "gex-levels oi":
+                    probe_levels = lv
                 if lv:
                     tm = lv["time"]
                     info = (f"flip {lv['flip']}｜nearby_flips {lv['flips']}｜call {lv['call']}｜put {lv['put']}｜"
@@ -2174,7 +2293,7 @@ def run_probe(cfg: Cfg, uw: UW, tg: Telegram, now_fn=now_et) -> None:
         except Exception as e:  # noqa: BLE001
             lines_ok.append(f"⚠ 资金流回放异常 {type(e).__name__}")
     try:
-        lines_ok.extend(run_probe_extras(cfg, uw, probe_price, now_u))
+        lines_ok.extend(run_probe_extras(cfg, uw, probe_price, now_u, probe_levels))
     except Exception as e:  # noqa: BLE001
         lines_ok.append(f"⚠ 扩展接口检查异常 {type(e).__name__}")
     lim = getattr(uw, "limits", None) or {}
