@@ -143,9 +143,12 @@ class Cfg:
         self.tide_window_min = f("TIDE_WINDOW_MIN", 10)
         self.tide_z = f("TIDE_Z", 3.0)              # 纯噪音下约每天 0.5~1 次误触发；单独出现不会推送
         self.tide_abs_min = f("TIDE_ABS_MIN", 1000000)
-        self.tide_min_ticks = int(f("TIDE_MIN_TICKS", 45))
+        self.tide_min_ticks = int(f("TIDE_MIN_TICKS", 20))
+        self.tide_open_guard = f("TIDE_OPEN_GUARD_MIN", 20)   # 开盘后头 N 分钟成交最密，只显示不触发资金流信号
         self.print_min = f("PRINT_MIN_PREMIUM", 250000)
-        self.print_burst = f("PRINT_BURST_PREMIUM", 3000000)
+        # 实测 SPY 一天约 330 笔 ≥$25万 的大单提醒（中位数约 $50万）：10 分钟同向合计 $300 万~$600 万是家常便饭，
+        # 门槛定在 $1500 万，常规日约 1~2 次/天
+        self.print_burst = f("PRINT_BURST_PREMIUM", 15000000)
         self.print_min_count = int(f("PRINT_MIN_COUNT", 3))
         self.print_dominance = f("PRINT_DOMINANCE", 3.0)
         self.print_window_min = f("PRINT_WINDOW_MIN", 10)
@@ -161,7 +164,7 @@ class Cfg:
         self.single_cooldown_min = f("SINGLE_COOLDOWN_MIN", 15)
         self.mega_cooldown_min = f("MEGA_COOLDOWN_MIN", 5)
         self.daily_cap = int(f("DAILY_PUSH_CAP", 6))               # 新信号/单一事件/巨额单：每日带提示音上限
-        self.run_cap = int(f("RUN_PUSH_CAP", 6))                   # 已有信号的“延续/升级”提醒：单独的每日上限      # 每天带提示音的信号推送上限，超过后自动转静音
+        self.run_cap = int(f("RUN_PUSH_CAP", 6))                   # 已有信号的“延续/升级”提醒：单独的每日上限；两类上限超出后都自动转静音
 
         # 数据健康
         self.stale_price_s = f("STALE_PRICE_SECONDS", 90)
@@ -637,12 +640,24 @@ def compute_zone(lv, cfg: Cfg, buf=None):
     return {"center": flip, "lo": lo, "hi": hi, "low": lo - b, "high": hi + b, "n": len(cluster), "buf": b}
 
 
+def is_rth(dt) -> bool:
+    """是否在美股常规交易时段（9:30–16:00 ET）。UW 的资金流 tick 从 7:30 到 16:15，盘前盘后很清淡，不能混进波动基线。"""
+    e = dt.astimezone(ET)
+    m = e.hour * 60 + e.minute
+    return 9 * 60 + 30 <= m < 16 * 60
+
+
+def minutes_since_open(dt) -> float:
+    e = dt.astimezone(ET)
+    return (e - e.replace(hour=9, minute=30, second=0, microsecond=0)).total_seconds() / 60.0
+
+
 def tide_stats(ticks, now_u: datetime, window_min: float, sigma_prev, cfg: Cfg):
-    """x = 每分钟(call 净权利金 − put 净权利金)，正=看多倾向。"""
+    """x = 每分钟(call 净权利金 − put 净权利金)，正=看多倾向。波动基线只用常规时段的 tick。"""
     xs = [(t["t"], t["ncp"] - t["npp"]) for t in ticks]
     cut = now_u - timedelta(minutes=window_min)
     recent = [x for (tt, x) in xs if tt > cut]
-    past = [x for (tt, x) in xs if tt <= cut]
+    past = [x for (tt, x) in xs if tt <= cut and is_rth(tt)]
     S = sum(recent)
     sigma = None
     if len(past) >= cfg.tide_min_ticks:
@@ -676,7 +691,7 @@ def realized_sigma_1m_pct(px_hist):
 
 
 def sigma_from_ticks(ticks):
-    xs = [t["ncp"] - t["npp"] for t in ticks]
+    xs = [t["ncp"] - t["npp"] for t in ticks if is_rth(t["t"])]
     if len(xs) < 100:
         return None
     try:
@@ -1048,7 +1063,8 @@ class Engine:
             tide = tide_stats(ticks, now_u, cfg.tide_window_min, f.get("sigma_prev"), cfg)
             self.view["tide"] = tide
             z = tide["z"]
-            if z is not None:
+            guarded = (not cfg.force_run) and minutes_since_open(now) < cfg.tide_open_guard
+            if z is not None and not guarded:
                 cur = None
                 if z >= cfg.tide_z and tide["S"] >= cfg.tide_abs_min:
                     cur = "up"
@@ -1532,6 +1548,8 @@ class Fetcher:
         self.cache: dict = {}
         self.disabled: dict = {}
         self.errs: dict = {}
+        self.status: dict = {}            # 每个接口最近一次失败的 HTTP 状态码
+        self.flow_newer_ok = True         # flow-alerts 的 newer_than 参数是否可用（被拒绝时自动降级为普通查询）
         self.fatal = None
         self.pause_until = None
 
@@ -1553,6 +1571,7 @@ class Fetcher:
             self.errs[name] = "返回内容无法解析"
             return None
         self.errs[name] = r.err or f"HTTP {r.status}"
+        self.status[name] = r.status
         if r.status in (401, 402):
             self.fatal = r
         elif r.status == 429 and r.code and "daily_request_limit_hit" in r.code:
@@ -1598,10 +1617,18 @@ class Fetcher:
             cur = parse_iso(eng.s["flow"].get("cursor")) if eng.s["flow"].get("cursor") else None
             # 回看 5 分钟重叠（按 key 去重），防止个别提醒"迟到入库"被漏掉
             since = (cur - timedelta(minutes=5)) if cur else (now.astimezone(UTC) - timedelta(days=4 if cfg.force_run else 0, minutes=30))
+            base = {"ticker_symbol": sym, "limit": 100, "min_premium": int(cfg.print_min)}
+            parser = lambda raw: parse_flow(raw, now.astimezone(ET).date())  # noqa: E731
             items = self.fetch("flow", "/api/option-trades/flow-alerts",
-                               {"ticker_symbol": sym, "limit": 100, "min_premium": int(cfg.print_min),
-                                "newer_than": int(since.timestamp())},
-                               lambda raw: parse_flow(raw, now.astimezone(ET).date()), now)
+                               dict(base, newer_than=int(since.timestamp())) if self.flow_newer_ok else base,
+                               parser, now)
+            if items is None and self.flow_newer_ok and self.status.get("flow") in (400, 422):
+                # newer_than 参数被拒绝：改用不带该参数的普通查询（靠 key 去重），而不是让整个大单功能停用
+                self.flow_newer_ok = False
+                self.disabled.pop("flow", None)
+                self.errs.pop("flow", None)
+                log("flow-alerts 不接受 newer_than，已降级为普通查询")
+                items = self.fetch("flow", "/api/option-trades/flow-alerts", base, parser, now)
             if items is not None:
                 snap["flow_new"] = items
                 if items:
@@ -1750,6 +1777,96 @@ def shape(obj, depth: int = 0) -> str:
     return "null" if obj is None else type(obj).__name__
 
 
+def replay_tide(ticks, cfg: Cfg, z_list=(2.5, 3.0, 3.5, 4.0)) -> dict:
+    """在一个完整交易日的 tick 上回放 tide 规则（只用"当时已有"的数据估 σ，和实盘一致），返回 {z阈值: [(时刻, 方向, 净额, z), ...]}。"""
+    tk = [t for t in ticks if is_rth(t["t"])]
+    out = {z: [] for z in z_list}
+    if len(tk) < cfg.tide_min_ticks + int(cfg.tide_window_min) + 5:
+        return out
+    stats = []
+    for i in range(len(tk)):
+        stats.append(tide_stats(tk[:i + 1], tk[i]["t"], cfg.tide_window_min, None, cfg))
+    for z_thr in z_list:
+        state = None
+        for i, st in enumerate(stats):
+            if minutes_since_open(tk[i]["t"]) < cfg.tide_open_guard or st["z"] is None:
+                continue
+            z, cur = st["z"], None
+            if z >= z_thr and st["S"] >= cfg.tide_abs_min:
+                cur = "up"
+            elif z <= -z_thr and st["S"] <= -cfg.tide_abs_min:
+                cur = "down"
+            if cur:
+                if cur != state:
+                    out[z_thr].append((tk[i]["t"], cur, st["S"], z))
+                state = cur
+            elif abs(z) < z_thr * 0.6:
+                state = None
+    return out
+
+
+def replay_prints(items, cfg: Cfg, bursts=(5e6, 8e6, 10e6, 15e6, 20e6)) -> dict:
+    """在已拉取的大单提醒上回放"同向大单"规则，返回 {门槛: {日期: 触发次数}}（按 ET 日期，仅常规时段）。"""
+    bursts = sorted({float(b) for b in bursts} | {float(cfg.print_burst)})
+    by_day = {}
+    for x in items:
+        if x["prem"] >= cfg.print_min:
+            by_day.setdefault(x["tdt"].astimezone(ET).date(), []).append(x)
+    res = {b: {} for b in bursts}
+    for d, xs in by_day.items():
+        xs.sort(key=lambda x: x["tdt"])
+        open_dt = datetime(d.year, d.month, d.day, 9, 30, tzinfo=ET)
+        series = []
+        for m in range(0, 391):
+            t = open_dt + timedelta(minutes=m)
+            lo = t - timedelta(minutes=cfg.print_window_min)
+            w = [x for x in xs if lo < x["tdt"] <= t]
+            series.append((sum(x["prem"] for x in w if x["sign"] > 0), sum(x["prem"] for x in w if x["sign"] < 0),
+                           sum(1 for x in w if x["sign"] > 0), sum(1 for x in w if x["sign"] < 0)))
+        for b in bursts:
+            state, n = None, 0
+            for up, dn, n_up, n_dn in series:
+                cur = None
+                if up >= b and n_up >= cfg.print_min_count and up >= cfg.print_dominance * dn:
+                    cur = "up"
+                elif dn >= b and n_dn >= cfg.print_min_count and dn >= cfg.print_dominance * up:
+                    cur = "down"
+                if cur:
+                    if cur != state:
+                        n += 1
+                    state = cur
+                elif max(up, dn) < 0.5 * b:
+                    state = None
+            res[b][d] = n
+    return res
+
+
+def tide_replay_report(ticks, cfg: Cfg) -> str:
+    tk = [t for t in ticks if is_rth(t["t"])]
+    if len(tk) < 100:
+        return "ℹ️ 资金流回放：常规时段 tick 不足 100 个，跳过"
+    day = tk[-1]["t"].astimezone(ET).date()
+    tk = [t for t in tk if t["t"].astimezone(ET).date() == day]
+    res = replay_tide(tk, cfg)
+    parts = []
+    for z, evs in res.items():
+        times = "、".join(f"{hm(e[0])}{'多' if e[1] == 'up' else '空'}" for e in evs[:5])
+        parts.append(f"z≥{z:g} → {len(evs)}次" + (f"（{times}{'…' if len(evs) > 5 else ''}）" if evs else ""))
+    return (f"📈 资金流回放（{day}，{cfg.tide_window_min:.0f}分钟窗口｜|净额|≥{money(cfg.tide_abs_min)}｜开盘后{cfg.tide_open_guard:.0f}分钟起算｜当前 TIDE_Z={cfg.tide_z:g}）\n   "
+            + "｜".join(parts))
+
+
+def prints_replay_report(items, cfg: Cfg) -> str:
+    res = replay_prints(items, cfg)
+    days = sorted({d for per in res.values() for d in per})
+    L = [f"📈 大单回放（≥{money(cfg.print_min)}的提醒，同向合计≥门槛＋≥{cfg.print_min_count}笔＋≥{cfg.print_dominance:g}倍于反向，窗口{cfg.print_window_min:.0f}分钟）"]
+    for b, per in res.items():
+        mark = "（当前默认）" if abs(b - cfg.print_burst) < 1 else ""
+        L.append(f"   门槛 ≥{money(b)}{mark}：" + "｜".join(f"{d.strftime('%m-%d')} {per.get(d, 0)}次" for d in days))
+    L.append("   （最早一天的数据可能不完整，仅供参考）")
+    return "\n".join(L)
+
+
 def flow_rate_report(items, cfg: Cfg) -> str:
     """把 flow-alerts 的条数 / 金额分布 / 方向分布整理成几行，用来校准大单阈值。"""
     if not items:
@@ -1787,12 +1904,172 @@ def flow_rate_report(items, cfg: Cfg) -> str:
     return "\n".join(L)
 
 
+# ---- 扩展接口（监控暂未使用；探测时检查可用性与数据是否合理，为下一阶段功能做准备） ----
+def _any_ts(v):
+    """时间戳可能是 ISO 字符串，也可能是毫秒/秒数字；都按 UTC 解析，失败返回 None。"""
+    if isinstance(v, str):
+        return parse_iso(v) or _ts_from_ms(v)
+    return _ts_from_ms(v)
+
+
+def _data_rows(raw) -> list:
+    d = unwrap(raw)
+    if isinstance(d, dict):
+        d = d.get("data", d)
+    return [r for r in d if isinstance(r, dict)] if isinstance(d, list) else []
+
+
+def parse_strike_gamma(raw):
+    """/spot-exposures/strike → 按行权价升序的 [{strike, price, time, c_oi, p_oi, c_vol, p_vol}]；无可用行返回 None。"""
+    out = []
+    for r in _data_rows(raw):
+        k = num(r.get("strike"))
+        if k is None:
+            continue
+        out.append({"strike": k, "price": num(r.get("price")), "time": _any_ts(r.get("time")),
+                    "c_oi": num(r.get("call_gamma_oi")), "p_oi": num(r.get("put_gamma_oi")),
+                    "c_vol": num(r.get("call_gamma_vol")), "p_vol": num(r.get("put_gamma_vol"))})
+    out.sort(key=lambda x: x["strike"])
+    return out or None
+
+
+def strike_walls(rows, ref, key: str):
+    """传统意义的墙：现价之上 call gamma 绝对值最大的行权价 = Call Wall；现价之下 put gamma 绝对值最大的 = Put Wall。返回 (前3 call, 前3 put)。"""
+    ck, pk = "c_" + key, "p_" + key
+    ups = sorted(((abs(r[ck]), r["strike"]) for r in rows if r["strike"] >= ref and r.get(ck) is not None), reverse=True)
+    dns = sorted(((abs(r[pk]), r["strike"]) for r in rows if r["strike"] <= ref and r.get(pk) is not None), reverse=True)
+    return ups[:3], dns[:3]
+
+
+def strike_gamma_report(rows, spot=None) -> str:
+    if not rows:
+        return "ℹ️ 按行权价 gamma：无数据"
+    prices = sorted(r["price"] for r in rows if r.get("price"))
+    ref = prices[len(prices) // 2] if prices else spot
+    if not ref:
+        return "ℹ️ 按行权价 gamma：缺少参考价，无法计算"
+    ts = [r["time"] for r in rows if r.get("time")]
+    ks = [r["strike"] for r in rows]
+    when = f"｜快照 {hmd(min(ts))}～{hmd(max(ts))} ET" if ts else ""
+    L = [f"🧱 按行权价 gamma（spot-exposures/strike｜{len(rows)}个行权价 {min(ks):g}–{max(ks):g}｜参考价 {ref:.2f}{when}）"]
+
+    def signs(k):
+        v = [r[k] for r in rows if r.get(k)]
+        return f"正{sum(1 for x in v if x > 0)}/负{sum(1 for x in v if x < 0)}"
+
+    L.append(f"   符号：call_gamma_oi {signs('c_oi')}｜put_gamma_oi {signs('p_oi')}（用来确认 put gamma 是否为负数）")
+
+    def fmt(lst):
+        return "｜".join(f"{k:g}({(k - ref) / ref * 100:+.1f}%) {money(v).replace('$', '')}" for v, k in lst) or "无"
+
+    for key, name in (("oi", "OI口径"), ("vol", "成交口径")):
+        ups, dns = strike_walls(rows, ref, key)
+        L.append(f"   {name} Call Wall 前3：{fmt(ups)}")
+        L.append(f"   {name} Put Wall 前3：{fmt(dns)}")
+    return "\n".join(L)
+
+
+def parse_spot_series(raw):
+    """/spot-exposures（分钟级）→ [{t, price, oi, vol, dir}]，按时间升序。"""
+    out = []
+    for r in _data_rows(raw):
+        t = _any_ts(r.get("time"))
+        if t is None:
+            continue
+        out.append({"t": t, "price": num(r.get("price")), "oi": num(r.get("gamma_per_one_percent_move_oi")),
+                    "vol": num(r.get("gamma_per_one_percent_move_vol")), "dir": num(r.get("gamma_per_one_percent_move_dir"))})
+    out.sort(key=lambda x: x["t"])
+    return out or None
+
+
+def spot_series_report(rows) -> str:
+    if not rows:
+        return "ℹ️ 分钟级 gamma 序列：无数据"
+    last = rows[-1]
+    d = [x["dir"] for x in rows if x["dir"] is not None]
+    flips = sum(1 for a, b in zip(d, d[1:]) if a * b < 0)
+    rng = f"{money(min(d)).replace('$', '')}～{money(max(d)).replace('$', '')}" if d else "n/a"
+    f = lambda v: "n/a" if v is None else money(v, True).replace("$", "")  # noqa: E731
+    return (f"📉 分钟级 gamma 序列（spot-exposures｜{len(rows)}行｜{hmd(rows[0]['t'])}→{hmd(rows[-1]['t'])} ET）\n"
+            f"   最新：成交方向口径 {f(last['dir'])}｜成交口径 {f(last['vol'])}｜OI口径 {f(last['oi'])}｜当天方向口径区间 {rng}｜正负号切换 {flips} 次")
+
+
+def parse_greek_flow(raw):
+    """/greek-flow（分钟级 delta / vega 流向）→ [{t, dd, dv, td, tv}]：dd/dv=方向性(dir) delta/vega 流，td/tv=总量。"""
+    out = []
+    for r in _data_rows(raw):
+        t = _any_ts(r.get("timestamp")) or _any_ts(r.get("time"))
+        if t is None:
+            continue
+        out.append({"t": t, "dd": num(r.get("dir_delta_flow")), "dv": num(r.get("dir_vega_flow")),
+                    "td": num(r.get("total_delta_flow")), "tv": num(r.get("total_vega_flow"))})
+    out.sort(key=lambda x: x["t"])
+    return out or None
+
+
+def greek_flow_report(rows) -> str:
+    if not rows:
+        return "ℹ️ delta/vega 流向：无数据"
+    rth = [x for x in rows if is_rth(x["t"])]
+
+    def stat(k):
+        v = [x[k] for x in rth if x[k] is not None]
+        if len(v) < 5:
+            return "n/a"
+        return f"Σ{money(sum(v), True).replace('$', '')} σ{money(statistics.pstdev(v)).replace('$', '')}"
+
+    return (f"🌊 delta/vega 流向（greek-flow｜{len(rows)}行，常规时段 {len(rth)} 行｜{hmd(rows[0]['t'])}→{hmd(rows[-1]['t'])} ET）\n"
+            f"   方向性 delta 流 {stat('dd')}｜方向性 vega 流 {stat('dv')}｜总 delta 流 {stat('td')}（Σ=全天合计，σ=每分钟波动）")
+
+
+def sample_fields(raw, n: int = 16) -> str:
+    rows = _data_rows(raw)
+    if not rows:
+        return "（无数据行）"
+    return f"{len(rows)}行｜字段：" + ", ".join(list(rows[0].keys())[:n]) + ("…" if len(rows[0]) > n else "")
+
+
+def run_probe_extras(cfg: Cfg, uw: UW, price, now_u) -> list:
+    """逐个检查扩展接口；每个接口独立 try，任何一个出错都不影响其余。返回要追加到报告里的行。"""
+    sym = cfg.symbol
+    out = []
+    p = {"limit": 500}
+    if price:
+        p.update(min_strike=int(price * 0.94), max_strike=int(price * 1.06) + 1)
+    specs = [
+        ("按行权价 gamma", f"/api/stock/{sym}/spot-exposures/strike", p,
+         lambda r: strike_gamma_report(parse_strike_gamma(r), price)),
+        ("分钟级 gamma 序列", f"/api/stock/{sym}/spot-exposures", None,
+         lambda r: spot_series_report(parse_spot_series(r))),
+        ("delta/vega 流向", f"/api/stock/{sym}/greek-flow", None,
+         lambda r: greek_flow_report(parse_greek_flow(r))),
+        ("option-contracts", f"/api/stock/{sym}/option-contracts", {"limit": 3, "exclude_zero_dte": "false"}, sample_fields),
+        ("interpolated-iv", f"/api/stock/{sym}/interpolated-iv", None, sample_fields),
+    ]
+    ok = 0
+    for name, path, params, fmt in specs:
+        try:
+            r = uw.get(path, params, retries=1)
+            log(f"probe(扩展) {name}: HTTP {r.status} {r.ms}ms")
+            if not r.ok:
+                out.append(f"❌ {name}｜HTTP {r.status}｜{(r.err or '')[:120]}")
+                continue
+            ok += 1
+            txt = fmt(r.data)
+            out.append(txt if txt.startswith(("🧱", "📉", "🌊")) else f"✅ {name}｜{txt}")
+        except Exception as e:  # noqa: BLE001
+            out.append(f"⚠ {name} 解析异常 {type(e).__name__}")
+    out.insert(0, f"🧩 扩展接口检查（监控暂未使用，为后续功能做准备）｜{ok}/{len(specs)} 项可用")
+    return out
+
+
 def run_probe(cfg: Cfg, uw: UW, tg: Telegram, now_fn=now_et) -> None:
     now = now_fn()
     sym = cfg.symbol
     today = now.astimezone(ET).date()
     prev = prev_weekdays(today, 1)[0].isoformat()
     now_u = now.astimezone(UTC)
+    probe_price = None
     tests = [
         ("quote", f"/api/stock/{sym}/quote", None),
         ("stock-state(备用价格)", f"/api/stock/{sym}/stock-state", None),
@@ -1806,6 +2083,7 @@ def run_probe(cfg: Cfg, uw: UW, tg: Telegram, now_fn=now_et) -> None:
         ("potus posts", "/api/potus/posts", None),
     ]
     lines_ok, lines_shape, n_ok = [], [], 0
+    probe_ticks = None
     for name, path, params in tests:
         r = uw.get(path, params, retries=1)
         log(f"probe {name}: HTTP {r.status} {r.ms}ms {'OK' if r.ok else (r.err or '')[:80]}")
@@ -1818,6 +2096,7 @@ def run_probe(cfg: Cfg, uw: UW, tg: Telegram, now_fn=now_et) -> None:
             if name == "quote":
                 q = parse_quote(r.data)
                 if q:
+                    probe_price = q["price"]
                     age = (now_u - q["ts"]).total_seconds() if q["ts"] else None
                     qa = q["quote_age_ms"]
                     info = (f"price {q['price']}｜成交时间 {hmd(q['ts'])} ET（距现在 {fmt_age(age)}）"
@@ -1837,6 +2116,8 @@ def run_probe(cfg: Cfg, uw: UW, tg: Telegram, now_fn=now_et) -> None:
                     info = "⚠ 解析失败"
             elif name.startswith("net-prem-ticks"):
                 tk = parse_ticks(r.data)
+                if tk and name == "net-prem-ticks":
+                    probe_ticks = tk
                 if tk:
                     sg = sigma_from_ticks(tk)
                     info = (f"{len(tk)}个tick｜{hmd(tk[0]['t'])}→{hmd(tk[-1]['t'])} ET｜全天 Call净 {money(sum(t['ncp'] for t in tk), True)} "
@@ -1867,11 +2148,35 @@ def run_probe(cfg: Cfg, uw: UW, tg: Telegram, now_fn=now_et) -> None:
         r = uw.get("/api/option-trades/flow-alerts",
                    {"ticker_symbol": sym, "limit": 500, "min_premium": int(cfg.print_min)}, retries=1)
         if r.ok:
-            lines_ok.append(flow_rate_report(parse_flow(r.data, today) or [], cfg))
+            fitems = parse_flow(r.data, today) or []
+            lines_ok.append(flow_rate_report(fitems, cfg))
+            if fitems:
+                lines_ok.append(prints_replay_report(fitems, cfg))
+                cutoff = max(x["tdt"] for x in fitems) - timedelta(minutes=30)     # 验证实盘用的 newer_than 参数是否有效
+                r2 = uw.get("/api/option-trades/flow-alerts",
+                            {"ticker_symbol": sym, "limit": 100, "min_premium": int(cfg.print_min),
+                             "newer_than": int(cutoff.timestamp())}, retries=1)
+                if r2.ok:
+                    its = parse_flow(r2.data, today) or []
+                    okf = all(x["tdt"] >= cutoff - timedelta(seconds=2) for x in its)
+                    rng = f"{hmd(min(x['tdt'] for x in its))}→{hmd(max(x['tdt'] for x in its))}" if its else "-"
+                    lines_ok.append(f"{'✅' if (its and okf) else '⚠'} newer_than 参数测试｜返回 {len(its)} 条｜{rng}｜"
+                                    + ("全部晚于截止时间，过滤有效" if okf else "含早于截止时间的记录，过滤可能无效"))
+                else:
+                    lines_ok.append(f"❌ newer_than 参数测试｜HTTP {r2.status}｜{(r2.err or '')[:140]}")
         else:
             lines_ok.append(f"❌ 大单频率统计｜HTTP {r.status}｜{(r.err or '')[:140]}")
     except Exception as e:  # noqa: BLE001
         lines_ok.append(f"⚠ 大单频率统计异常 {type(e).__name__}")
+    if probe_ticks:
+        try:
+            lines_ok.append(tide_replay_report(probe_ticks, cfg))
+        except Exception as e:  # noqa: BLE001
+            lines_ok.append(f"⚠ 资金流回放异常 {type(e).__name__}")
+    try:
+        lines_ok.extend(run_probe_extras(cfg, uw, probe_price, now_u))
+    except Exception as e:  # noqa: BLE001
+        lines_ok.append(f"⚠ 扩展接口检查异常 {type(e).__name__}")
     lim = getattr(uw, "limits", None) or {}
     lim_t = (f"额度头：limit={lim.get('limit')} count={lim.get('count')}" if lim
              else "额度头：无（符合 Basic 套餐“无每日请求上限”）")
