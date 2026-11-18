@@ -11,9 +11,11 @@ SPY 期权结构 + 资金流 实时监控（Unusual Whales API）→ Telegram
 
 信号三类（同向 ≥2 类才算"共振"）：
   结构   价格"确认"穿过 Flip 区（持续 60 秒）/ 确认突破 Call Wall、Put Wall（持续 45 秒）；
-         Flip 迁移、墙位同向移动只作为辅助证据
+         Flip 迁移、墙位同向移动只作为辅助证据。墙位按行权价的 OI gamma 取近端峰值；离现价不足 0.3% 的大持仓行权价
+         视为"磁吸位"、不当作墙（价格钉在它上面时不会反复报突破），价格从远处走近某堵墙时才锁定它
   动量   快速异动（20 分钟内幅度，阈值随当日波动自适应）/ 破位后继续延伸（每 0.2%）/ 价格里程碑
-  资金流 近 10 分钟净权利金（call 净 − put 净）异常偏离（z 分数）、同向大单合计、单笔巨额单
+  资金流 近 10 分钟净权利金（call 净 − put 净）异常偏离（z 分数）、同向大单合计、单笔巨额单；
+         大单在面板里按"买Call／卖Put／买Put／卖Call"拆开显示（含全天累计）
 
 防噪音：Flip 用"区间 + 随波动自适应的缓冲 + 持续确认"，来回震荡时自动降级；共振有冷却时间；
 同一波行情只在升级或明显延续时才再次提醒；"新信号"和"延续/升级提醒"各有每日带提示音上限（超出自动转静音）。
@@ -124,7 +126,10 @@ class Cfg:
         self.strike_every = f("STRIKE_EVERY_SECONDS", 300)     # OI 日内基本不变，5 分钟刷新一次足够
         self.strike_window_pct = f("STRIKE_WINDOW_PCT", 6.0)    # 只取现价 ±6% 内的行权价
         self.wall_sig = f("WALL_SIGNIFICANCE", 0.6)             # 近端墙的 gamma 需 ≥ 同侧最大值的 60%
-        self.wall_roll_pct = f("WALL_ROLL_PCT", 0.5)            # 价格越过墙 0.5% 以上才换到下一道墙（期间仍按"已突破"处理）
+        # 离现价不足 0.3% 的行权价是"磁吸位"（价格正钉在它上面），不当作墙，否则价格在它上下晃几下就会反复报"突破"；
+        # 但价格从远处走近某堵墙时，这堵墙会被锁定，之后照常判断突破（见 pick_walls）
+        self.wall_min_pct = f("WALL_MIN_PCT", 0.30)
+        self.wall_roll_pct = f("WALL_ROLL_PCT", 0.5)            # 已锁定的墙：价格越过它 0.5% 以上才换到下一道墙（期间仍按"已突破"处理）
 
         # 结构信号
         self.flip_buffer = f("FLIP_BUFFER", 0.20)             # Flip 区缓冲下限（美元）；实际会随波动自动放大
@@ -570,6 +575,37 @@ def flow_sign(typ: str, prem, ask, bid):
     return (1 if buy == is_call else -1), ("ask" if buy else "bid")
 
 
+# 大单按"买/卖 × Call/Put"拆开：成交在 ask 侧算买、bid 侧算卖，买卖混合/方向不明归入 unclear。
+# 买Call、卖Put = 偏多；买Put、卖Call = 偏空。
+MIX_LABEL = (("buy_call", "买Call"), ("sell_put", "卖Put"), ("buy_put", "买Put"), ("sell_call", "卖Call"), ("unclear", "方向不明"))
+MIX_BULL, MIX_BEAR = ("buy_call", "sell_put"), ("buy_put", "sell_call")
+
+
+def mix_key(typ, side) -> str:
+    if typ in ("call", "put") and side in ("ask", "bid"):
+        return f"{'buy' if side == 'ask' else 'sell'}_{typ}"
+    return "unclear"
+
+
+def mix_add(mix: dict, typ, side, prem) -> None:
+    m = mix.setdefault(mix_key(typ, side), [0.0, 0])
+    m[0] += prem
+    m[1] += 1
+
+
+def print_mix(items) -> dict:
+    mix: dict = {}
+    for x in items:
+        mix_add(mix, x.get("type"), x.get("side"), x["prem"])
+    return mix
+
+
+def mix_text(mix: dict, keys=None) -> str:
+    """{"buy_call": [权利金合计, 笔数], …} → "买Call $9.1M（3笔）｜卖Put $3.2M（2笔）"；只列有数据的项。"""
+    parts = [f"{label} {money(mix[k][0])}（{mix[k][1]}笔）" for k, label in MIX_LABEL if k in mix and (keys is None or k in keys)]
+    return "｜".join(parts)
+
+
 def parse_flow(raw, today: date):
     d = unwrap(raw)
     if isinstance(d, dict):
@@ -650,36 +686,53 @@ def compute_zone(lv, cfg: Cfg, buf=None):
     return {"center": flip, "lo": lo, "hi": hi, "low": lo - b, "high": hi + b, "n": len(cluster), "buf": b}
 
 
-def pick_walls(rows, spot, cfg: Cfg):
+def pick_walls(rows, spot, cfg: Cfg, prev=None):
     """按行权价的 OI gamma 选"近端墙"。
-    Call Wall：现价上方（含"已越过但不足 wall_roll_pct"的）call gamma 集中度 ≥ 同侧最大值×wall_sig、且为局部峰值的最近行权价；
-    Put Wall：对称。同时返回同侧"最大墙"（集中度最大的行权价）。数据不足返回 None；某一侧无候选则该侧为 None。
-    同一个行权价若同时被选为 Call Wall 和 Put Wall（价格被钉在大持仓行权价附近），它只算价格"另一侧"的那堵墙。
+    Call Wall：现价上方、call gamma 集中度 ≥ 同侧最大值×wall_sig 且为局部峰值的最近行权价；Put Wall：对称。
+    同时返回同侧"最大墙"（集中度最大的行权价）。数据不足返回 None；某一侧无候选则该侧为 None。
+    三条规则：
+    ① 离现价不足 wall_min_pct 的行权价不当作墙——价格正钉在大持仓行权价上时，它是"磁吸位"，不是要"突破"的墙
+       （当成墙，价格在它上下晃几下就会反复报突破）；墙改选更远的一道。
+    ② 锁定：prev = {"call": 上一轮的 Call Wall, "put": 上一轮的 Put Wall}（某一侧的突破已确认就不要传，让墙立刻让位给下一道）。
+       价格从远处走近某堵墙时，这堵墙已被选中并锁定；之后价格靠近它（进入 wall_min_pct 以内）、甚至刚越过它时仍保留，
+       直到价格越过它 wall_roll_pct 以上才换到下一道墙。否则墙会在价格靠近时消失，突破就无从判断。
+    ③ 同一个行权价若同时被选为 Call Wall 和 Put Wall，它只算价格"另一侧"的那堵墙。
     rows 来自 parse_strike_gamma：[{strike, c_oi, p_oi, ...}]（call gamma 为正、put gamma 为负，取绝对值比较）。"""
     if not rows or not spot or len(rows) < 8:
         return None
     roll = cfg.wall_roll_pct / 100.0
+    near = cfg.wall_min_pct / 100.0
+    prev = prev or {}
     pts_by = {kind: {r["strike"]: abs(r[key]) for r in rows if r.get(key) is not None}
               for kind, key in (("call", "c_oi"), ("put", "p_oi"))}
+    orders = {kind: sorted(pts) for kind, pts in pts_by.items()}
+
+    def is_peak(kind, k):
+        pts, order = pts_by[kind], orders[kind]
+        i = order.index(k)
+        nb = [pts[order[j]] for j in range(max(0, i - 2), min(len(order), i + 3)) if j != i]
+        return all(pts[k] >= x for x in nb)
 
     def choose(kind, exclude=()):
         pts = pts_by[kind]
-        order = sorted(pts)
+        order = orders[kind]
+        lock = prev.get(kind)
+        if lock is not None:                            # 锁定的墙必须仍是这一侧有数据的行权价
+            lock = next((k for k in order if abs(k - lock) < 1e-6 and pts[k] > 0), None)
         if kind == "call":
-            cand = [k for k in order if k >= spot * (1 - roll) and pts[k] > 0 and k not in exclude]
+            far = lambda k: k >= spot * (1 + near)      # noqa: E731  在现价上方、且离现价够远
+            held = lambda k: k >= spot * (1 - roll)     # noqa: E731  价格尚未越过它 roll 以上
         else:
-            cand = [k for k in order if k <= spot * (1 + roll) and pts[k] > 0 and k not in exclude]
+            far = lambda k: k <= spot * (1 - near)      # noqa: E731
+            held = lambda k: k <= spot * (1 + roll)     # noqa: E731
+        # 候选 = 离现价够远的行权价 + 仍被锁定的墙（即使价格已走进 wall_min_pct 以内、或刚越过它）
+        cand = [k for k in order if pts[k] > 0 and k not in exclude and (far(k) or (k == lock and held(k)))]
         if not cand:
             return None, None
         kmax = max(cand, key=lambda k: pts[k])
         gmax = pts[kmax]
-
-        def is_peak(k):
-            i = order.index(k)
-            nb = [pts[order[j]] for j in range(max(0, i - 2), min(len(order), i + 3)) if j != i]
-            return all(pts[k] >= x for x in nb)
-
-        sig = [k for k in cand if pts[k] >= cfg.wall_sig * gmax and is_peak(k)]
+        # 锁定墙只在"不够远"时才免于显著性检验（它被选中时已通过检验；数据小幅漂移不应让它在价格贴近时消失）
+        sig = [k for k in cand if (k == lock and not far(k)) or (pts[k] >= cfg.wall_sig * gmax and is_peak(kind, k))]
         return ((min(sig) if kind == "call" else max(sig)) if sig else kmax), kmax
 
     out = {}
@@ -689,6 +742,17 @@ def pick_walls(rows, spot, cfg: Cfg):
         k = out["call"]
         drop = "call" if spot >= k else "put"          # 价格在它上方 → 它是支撑（Put Wall）；在它下方 → 它是阻力（Call Wall）
         out[drop], _ = choose(drop, exclude=(k,))
+    # 被当作"磁吸位"跳过的近处大持仓行权价（仅用于面板/探测显示，让人看得出为什么墙没落在它上面）
+    pins = []
+    gall = {kind: max(pts.values()) for kind, pts in pts_by.items() if pts}
+    for k in sorted({k for pts in pts_by.values() for k in pts}):
+        if abs(k - spot) >= spot * near or k in (out["call"], out["put"]):
+            continue
+        kinds = [nm for kind, nm in (("call", "Call"), ("put", "Put"))
+                 if k in pts_by[kind] and kind in gall and pts_by[kind][k] >= cfg.wall_sig * gall[kind] and is_peak(kind, k)]
+        if kinds:
+            pins.append({"strike": k, "kinds": kinds})
+    out["pins"] = sorted(pins, key=lambda p: abs(p["strike"] - spot))[:2]
     return out
 
 
@@ -769,7 +833,7 @@ def new_state(date_str: str) -> dict:
         "flags": {"migration": None, "wall_shift": None},
         "events": [], "day_events": [],
         "flow": {"seen": [], "items": [], "tide_state": None, "prints_state": None,
-                 "sigma_prev": None, "sigma_prev_done": False},
+                 "sigma_prev": None, "sigma_prev_done": False, "day_mix": {}},
         "run": None, "last_push": {}, "outbox": [],
         "outage": {"since": None, "notified": False},
         "notified": {}, "digest_close": False, "greek": None,
@@ -1091,6 +1155,8 @@ class Engine:
                 continue
             f["seen"].append(it["key"])
             f["items"].append({k: it[k] for k in ("t", "sign", "side", "prem", "type", "strike", "dte", "rule", "iv", "delta")})
+            if it["prem"] >= cfg.print_min:                      # 全天累计：买/卖 × Call/Put（面板与收盘摘要用）
+                mix_add(f.setdefault("day_mix", {}), it.get("type"), it.get("side"), it["prem"])
             fresh = (now_u - it["tdt"]).total_seconds() <= 600
             if fresh and it["prem"] >= cfg.mega_min:
                 d = {1: "up", -1: "down"}.get(it["sign"])
@@ -1112,13 +1178,14 @@ class Engine:
         if cur:
             if cur != f["prints_state"]:
                 tot, cnt = (up, n_up) if cur == "up" else (dn, n_dn)
+                mixt = mix_text(print_mix(win), MIX_BULL if cur == "up" else MIX_BEAR)
                 self.add_event(now, "prints", cur,
-                               f"大单偏{'多' if cur == 'up' else '空'}：近{cfg.print_window_min:.0f}分钟同向合计 {money(tot)}（{cnt}笔）",
-                               P, prem=tot)
+                               f"大单偏{'多' if cur == 'up' else '空'}：近{cfg.print_window_min:.0f}分钟同向合计 {money(tot)}（{cnt}笔）"
+                               + (f"｜{mixt}" if mixt else ""), P, prem=tot)
             f["prints_state"] = cur
         elif max(up, dn) < 0.5 * cfg.print_burst:
             f["prints_state"] = None
-        self.view["prints"] = {"up": up, "dn": dn, "n_up": n_up, "n_dn": n_dn}
+        self.view["prints"] = {"up": up, "dn": dn, "n_up": n_up, "n_dn": n_dn, "mix": print_mix(win)}
 
         # 每分钟净权利金（tide）
         ticks = snap.get("ticks")
@@ -1390,6 +1457,9 @@ class Engine:
         t = v.get("tide")
         if t:
             L.append(f"全天净权利金：Call净 {money(t['ncp_day'], True)}｜Put净 {money(t['npp_day'], True)}（Put净为正=买put多于卖put）")
+        dm = s["flow"].get("day_mix")
+        if dm:
+            L.append(f"全天大单（≥{money(cfg.print_min)}）：" + mix_text(dm))
         g = s.get("greek")
         if g:
             L.append(f"日度净Gamma（OI口径）：{'偏正' if g['net'] > 0 else '偏负'}（净占比 {g['ratio'] * 100:+.0f}%）")
@@ -1536,6 +1606,10 @@ def render_panel(eng: Engine, now) -> str:
         if sm:
             uw_c, uw_p = prim.get("call_uw"), prim.get("put_uw")
             L.append(f"  墙位口径：按行权价 OI Gamma 取近端峰值（UW 自带：Call {fpx(uw_c)}／Put {fpx(uw_p)}）")
+            pins = prim.get("pins") or []
+            if pins:
+                L.append(f"  近处大持仓（离现价<{cfg.wall_min_pct:g}%，按磁吸位处理、不当墙）："
+                         + "、".join(f"{p['strike']:g}（{'/'.join(p['kinds'])}）" for p in pins))
         elif cfg.wall_mode == "strike":
             L.append("  墙位口径：按行权价数据暂不可用，暂用 UW 自带的 Call/Put Wall")
         if prim.get("magnet") is not None:
@@ -1568,16 +1642,22 @@ def render_panel(eng: Engine, now) -> str:
     else:
         L.append("净权利金：暂无数据")
     pr = v.get("prints")
-    if pr and (pr["up"] or pr["dn"]):
+    if pr and pr.get("mix"):
         L.append(f"大单（近{cfg.print_window_min:.0f}分钟，≥{money(cfg.print_min)}）：偏多 {money(pr['up'])}（{pr['n_up']}笔）｜偏空 {money(pr['dn'])}（{pr['n_dn']}笔）")
-    recent_items = [x for x in s["flow"]["items"] if x["prem"] >= cfg.print_min][-2:]
+        L.append("  明细：" + mix_text(pr["mix"]))
+    dm = s["flow"].get("day_mix")
+    if dm and not v.get("force"):
+        L.append(f"全天大单（≥{money(cfg.print_min)}）：" + mix_text(dm))
+    recent_items = [x for x in s["flow"]["items"] if x["prem"] >= cfg.print_min][-3:]
     if recent_items:
         L.append("最近大单：")
     for it in recent_items:
         dte = it.get("dte")
-        L.append(f"  {hm(parse_iso(it['t']))} {(it.get('type') or '?').upper()} {it.get('strike') or '?'} "
+        how = {"ask": "买入", "bid": "卖出"}.get(it.get("side"), "混合")
+        strike = f"{it['strike']:g}" if it.get("strike") is not None else "?"
+        L.append(f"  {hm(parse_iso(it['t']))} {(it.get('type') or '?').upper()} {strike} "
                  f"{'0DTE' if dte == 0 else (str(dte) + 'DTE' if dte is not None else '')} {money(it['prem'])} "
-                 f"{ {1: '偏多', -1: '偏空', 0: '方向不明'}[it['sign']] }")
+                 f"{how}→{ {1: '偏多', -1: '偏空', 0: '方向不明'}[it['sign']] }")
     L.append("")
     L.append("【动量】")
     imp = v.get("impulse")
@@ -1690,7 +1770,14 @@ class Fetcher:
                     self.fetch("strikes", f"/api/stock/{sym}/spot-exposures/strike",
                                {"limit": 500, "min_strike": int(px * (1 - w)), "max_strike": int(px * (1 + w)) + 1},
                                parse_strike_gamma, now, retries=1)
-                pw = pick_walls(self.cache.get("strikes"), px, cfg)
+                # 锁定：上一轮选中的墙（call_ref/put_ref）在价格走近时继续保留，避免墙在贴近时消失、突破无从判断。
+                # 但这堵墙的突破一旦确认，就交给 broken 状态去跟踪，墙立刻让位给下一道——否则相邻的两堵墙会漏掉第二堵。
+                lock = {}
+                for kind in ("call", "put"):
+                    ref, br = eng.s["walls"].get(f"{kind}_ref"), eng.s["broken"].get(kind)
+                    if ref is not None and not (br and abs(br["level"] - ref) < 1e-6):
+                        lock[kind] = ref
+                pw = pick_walls(self.cache.get("strikes"), px, cfg, lock)
                 if pw and (pw["call"] is not None or pw["put"] is not None):
                     lv = dict(snap["primary"])
                     lv["call_uw"], lv["put_uw"] = lv.get("call"), lv.get("put")
@@ -1698,6 +1785,7 @@ class Fetcher:
                         if pw[k] is not None:
                             lv[k] = pw[k]
                     lv["call_max"], lv["put_max"] = pw["call_max"], pw["put_max"]
+                    lv["pins"] = pw.get("pins") or []
                     snap["primary"] = lv
                     snap["wall_src"] = "strike"
         if cfg.live_src and cfg.live_src != cfg.primary_src:
@@ -2078,6 +2166,9 @@ def strike_gamma_report(rows, spot=None, cfg=None, uw_levels=None) -> str:
             def one(k):
                 return "无" if k is None else f"{k:g}({(k - ref) / ref * 100:+.1f}%)"
             L.append(f"   ▶ 监控将使用的近端墙（OI口径）：Call {one(pw['call'])}｜Put {one(pw['put'])}｜最大墙 Call {one(pw['call_max'])}｜Put {one(pw['put_max'])}")
+            if pw.get("pins"):
+                L.append(f"   ▶ 近处大持仓（离现价<{cfg.wall_min_pct:g}%，按磁吸位处理、不当墙）："
+                         + "、".join(f"{p['strike']:g}（{'/'.join(p['kinds'])}）" for p in pw["pins"]))
         else:
             L.append("   ▶ 近端墙：数据不足，监控将回退到 UW 自带的 Call/Put Wall")
         if uw_levels:
