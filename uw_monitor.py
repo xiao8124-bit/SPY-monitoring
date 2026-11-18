@@ -3,15 +3,18 @@
 SPY 期权结构 + 资金流 实时监控（Unusual Whales API）→ Telegram
 ====================================================================
 
-三种运行模式（由环境变量 MODE 控制，Actions 页面 Run workflow 时可选择）：
+四种运行模式（由环境变量 MODE 控制，Actions 页面 Run workflow 时可选择）：
   monitor        正式监控：美股常规时段内每 15 秒轮询一次，维护"实时面板"（同一条 Telegram 消息原地刷新、静音）；
-                 只在"共振"（结构/动量/资金流 ≥2 类同向）或关键结构事件、巨额单时才推送带提示音的消息；15:55 ET 发收盘摘要。
+                 只在"共振"（结构/动量/资金流 ≥2 类同向）或关键结构事件、巨额单时才推送带提示音的消息；15:55 ET 发收盘摘要
+                 （摘要里含"今日提醒复盘"：每条提醒按提醒价入场的现货收益）。每条推送都会记入 uw_state.json 的 journal，供回测使用。
   probe          接口探测：逐个调用 UW 接口，把状态码、字段结构、解析结果和大单频率统计发到 Telegram（首次部署用）。
   telegram-test  推送测试：发一条消息再编辑它，验证 Bot 与"原地刷新"功能。
+  backtest       提醒回测：读取内置样本（2026-11-17 的 11 条提醒）和 journal 里记录的真实提醒，用 UW 的 SPY 分钟线和
+                 0DTE 平值期权的分钟成交价，算"提醒后马上入场"在 +5/+15/+30/+60 分钟和 15:55 的收益、60 分钟内最好/最差收益，发到 Telegram。
 
 信号三类（同向 ≥2 类才算"共振"）：
   结构   价格"确认"穿过 Flip 区（持续 60 秒）/ 确认突破 Call Wall、Put Wall（持续 45 秒）；
-         Flip 迁移、墙位同向移动只作为辅助证据。墙位按行权价的 OI gamma 取近端峰值；离现价不足 0.3% 的大持仓行权价
+         Flip 迁移、墙位同向移动只作为辅助证据。墙位按行权价的 OI gamma 取近端峰值；离现价不足 0.1% 的大持仓行权价
          视为"磁吸位"、不当作墙（价格钉在它上面时不会反复报突破），价格从远处走近某堵墙时才锁定它
   动量   快速异动（20 分钟内幅度，阈值随当日波动自适应）/ 破位后继续延伸（每 0.2%）/ 价格里程碑
   资金流 近 10 分钟净权利金（call 净 − put 净）异常偏离（z 分数）、同向大单合计、单笔巨额单；
@@ -28,6 +31,7 @@ SPY 期权结构 + 资金流 实时监控（Unusual Whales API）→ Telegram
 """
 from __future__ import annotations
 
+import bisect
 import json
 import math
 import os
@@ -126,9 +130,9 @@ class Cfg:
         self.strike_every = f("STRIKE_EVERY_SECONDS", 300)     # OI 日内基本不变，5 分钟刷新一次足够
         self.strike_window_pct = f("STRIKE_WINDOW_PCT", 6.0)    # 只取现价 ±6% 内的行权价
         self.wall_sig = f("WALL_SIGNIFICANCE", 0.6)             # 近端墙的 gamma 需 ≥ 同侧最大值的 60%
-        # 离现价不足 0.3% 的行权价是"磁吸位"（价格正钉在它上面），不当作墙，否则价格在它上下晃几下就会反复报"突破"；
-        # 但价格从远处走近某堵墙时，这堵墙会被锁定，之后照常判断突破（见 pick_walls）
-        self.wall_min_pct = f("WALL_MIN_PCT", 0.30)
+        # 离现价不足 0.1%（SPY≈730 时约 0.73 美元，即价格几乎贴在这个行权价上）的行权价是"磁吸位"，不当作墙，
+        # 否则价格在它上下晃几下就会反复报"突破"；但价格从远处走近某堵墙时，这堵墙会被锁定，之后照常判断突破（见 pick_walls）
+        self.wall_min_pct = f("WALL_MIN_PCT", 0.10)
         self.wall_roll_pct = f("WALL_ROLL_PCT", 0.5)            # 已锁定的墙：价格越过它 0.5% 以上才换到下一道墙（期间仍按"已突破"处理）
 
         # 结构信号
@@ -184,6 +188,15 @@ class Cfg:
         # 数据健康
         self.stale_price_s = f("STALE_PRICE_SECONDS", 90)
         self.outage_s = f("OUTAGE_SECONDS", 180)
+
+        # 回测（MODE=backtest）：入场 = 提醒之后的下一根 1 分钟线的开盘价（再加 bt_delay_min 分钟模拟你的反应时间）；
+        # 期权 = 同方向、最接近平值的 0DTE 合约，买入/卖出各扣 bt_slip 美元/股（SPY 平值 0DTE 点差通常 0.01~0.03；1 张合约 = 100 股）
+        self.bt_slip = f("BT_SLIPPAGE", 0.03)
+        self.bt_delay_min = f("BT_DELAY_MIN", 0)
+        self.bt_kinds = [x.strip() for x in s("BT_KINDS", "conf,single,mega").split(",") if x.strip()]
+        self.bt_seed = b("BT_SEED", True)             # 是否包含内置的 2026-11-17 样本
+        self.bt_flow_days = int(f("BT_FLOW_DAYS", 5))  # "大单分类回测"回看最近几个交易日；0 = 不做
+        self.bt_deep = f("BT_DEEP_DELTA", 0.6)        # |delta| ≥ 此值视为"深实值"
 
 
 # ----------------------------------------------------------------------------
@@ -648,7 +661,10 @@ def parse_flow(raw, today: date):
                     "type": typ, "strike": strike, "dte": dte, "rule": r.get("alert_rule"),
                     "iv": num(r.get("iv")), "delta": num(r.get("delta")), "gamma": num(r.get("gamma")),
                     "vega": num(r.get("vega")), "chain": chain, "sweep": bool(r.get("has_sweep")),
-                    "size": num(r.get("total_size"))})
+                    "size": num(r.get("total_size")),
+                    # 以下仅供回测的"大单分类研究"使用（实盘引擎不读）：到期日、是否全为开仓、是否含多腿、未平仓量
+                    "expiry": str(expiry)[:10] if expiry else None, "opening": bool(r.get("all_opening_trades")),
+                    "multileg": bool(r.get("has_multileg")), "oi": num(r.get("open_interest"))})
     out.sort(key=lambda x: x["tdt"])
     return out
 
@@ -839,6 +855,8 @@ def new_state(date_str: str) -> dict:
         "notified": {}, "digest_close": False, "greek": None,
         "counters": {"cycles": 0, "pushed": 0, "silent": 0, "sent": 0, "loud_capped": 0},
         "prev_price": None,
+        "journal": [],      # 每条推送的提醒记录（跨日保留，供回测）：{t, k, d, p, s, x}
+        "day_px": [],       # 当天每分钟最后一个价格 [[分钟起点 epoch 秒, 价格], ...]（供收盘复盘）
     }
 
 
@@ -861,12 +879,93 @@ def save_state(path: str, st: dict) -> None:
 
 
 # ----------------------------------------------------------------------------
+# 提醒复盘（收盘摘要用）：每条提醒按"提醒价"入场的现货收益
+# ----------------------------------------------------------------------------
+KIND_ICON = {"conf": "🔔", "conf_run": "🔁", "single": "⚡", "mega": "🐋"}
+KIND_NAME = {"conf": "共振", "conf_run": "共振延续", "single": "结构", "mega": "巨额单"}
+
+
+def alert_scorecard(alerts, day_px, horizons=(15, 30, 60)):
+    """alerts：journal 记录（t/k/d/p）；day_px：[[分钟起点 epoch 秒, 该分钟最后价格], ...]。
+    返回 (rows, skipped)：rows 每条含 +H 分钟和"到最后一个价格"的方向收益（%）、之后的最大有利/不利（按分钟价）；
+    skipped = 方向不明（d 不是 up/down）而没计入的条数。数据还没走到的时间点记 None。"""
+    rows, skipped = [], 0
+    if not day_px:
+        return rows, skipped
+    ks = [x[0] for x in day_px]
+    last_t, last_p = ks[-1], day_px[-1][1]
+    for a in alerts:
+        d, t, p = a.get("d"), parse_iso(a.get("t")), num(a.get("p"))
+        if t is None or not p:
+            continue
+        if d not in ("up", "down"):
+            skipped += 1
+            continue
+        sg, te = (1 if d == "up" else -1), t.timestamp()
+        ret = {}
+        for H in horizons:
+            tt = te + H * 60
+            i = bisect.bisect_right(ks, tt) - 1
+            ret[H] = sg * (day_px[i][1] - p) / p * 100 if (tt <= last_t + 60 and i >= 0) else None
+        path = [x[1] for x in day_px[bisect.bisect_right(ks, te):]]
+        mfe = mae = last = None
+        if path:
+            fav = [sg * (q - p) / p * 100 for q in path]
+            mfe, mae, last = max(max(fav), 0.0), min(min(fav), 0.0), sg * (last_p - p) / p * 100
+        rows.append({"t": a["t"], "k": a.get("k"), "d": d, "p": p, "ret": ret, "last": last, "mfe": mfe, "mae": mae,
+                     "silent": bool(a.get("s"))})
+    return rows, skipped
+
+
+def _agg(vals):
+    v = [x for x in vals if x is not None]
+    if not v:
+        return 0, 0, None, None
+    return len(v), sum(1 for x in v if x > 0), sum(v) / len(v), statistics.median(v)
+
+
+def _pc(x, nd=2) -> str:
+    return "—" if x is None else f"{x:+.{nd}f}%"
+
+
+def scorecard_lines(rows, skipped, horizons=(15, 30, 60), max_rows=12) -> list:
+    if not rows:
+        return []
+    L = ["📋 今日提醒复盘（按提醒价入场｜现货口径｜不含期权杠杆和点差；样本很少，仅供参考）"]
+    parts = []
+    for H in horizons:
+        n, w, m, _ = _agg([r["ret"].get(H) for r in rows])
+        if n:
+            parts.append(f"+{H}分钟 赢{w}/{n} 均{m:+.2f}%")
+    n, w, m, _ = _agg([r["last"] for r in rows])
+    if n:
+        parts.append(f"到摘要时 赢{w}/{n} 均{m:+.2f}%")
+    L.append(f"共 {len(rows)} 条有方向" + (f"（另 {skipped} 条方向不明，未计入）" if skipped else "") + "｜" + "｜".join(parts))
+    kinds = []
+    for k in ("conf", "single", "mega"):
+        sub = [r for r in rows if r["k"] == k]
+        if sub:
+            n, w, m, _ = _agg([r["last"] for r in sub])
+            if n:
+                kinds.append(f"{KIND_ICON[k]}{KIND_NAME[k]} {len(sub)}条 赢{w}/{n} 均{m:+.2f}%")
+    if kinds:
+        L.append("到摘要时按类型：" + "｜".join(kinds))
+    for r in rows[-max_rows:]:
+        r15, r60 = r["ret"].get(15), r["ret"].get(60)
+        L.append(f"  {hm(parse_iso(r['t']))} {'▲' if r['d'] == 'up' else '▼'}{KIND_ICON.get(r['k'], '')} {r['p']:.2f}｜+15m {_pc(r15)}｜+60m {_pc(r60)}｜到摘要 {_pc(r['last'])}"
+                 f"｜最大有利 {_pc(r['mfe'])} 最大不利 {_pc(r['mae'])}" + ("｜🔕静音" if r.get("silent") else ""))
+    return L
+
+
+# ----------------------------------------------------------------------------
 # 引擎：逐周期更新信号 → 事件 → 共振 → 推送队列
 # ----------------------------------------------------------------------------
 class Engine:
     def __init__(self, cfg: Cfg, state: dict | None = None):
         self.cfg = cfg
         self.s = state if state else new_state("")
+        self.s.setdefault("journal", [])        # 兼容旧状态文件（STATE_VERSION 不变）
+        self.s.setdefault("day_px", [])
         self.new_events: list = []
         self.view: dict = {}
 
@@ -900,7 +999,7 @@ class Engine:
         self.new_events.append(e)
         return e
 
-    def queue_push(self, now, kind, text, silent=False):
+    def queue_push(self, now, kind, text, silent=False, P=None, d=None, brief=None):
         s = self.s
         if kind in ("conf", "single", "mega", "conf_run") and not silent:
             key, cap, what = (("loud_run", self.cfg.run_cap, "延续/升级提醒") if kind == "conf_run"
@@ -912,6 +1011,19 @@ class Engine:
                 s["counters"][key] = s["counters"].get(key, 0) + 1
         s["outbox"].append({"t": iso(now), "kind": kind, "text": text, "silent": bool(silent), "attempts": 0})
         s["counters"]["silent" if silent else "pushed"] += 1
+        if P is not None and kind in ("conf", "single", "mega", "conf_run"):
+            try:
+                self.journal_add(now, kind, d, P, bool(silent), brief or text)
+            except Exception:  # noqa: BLE001  记录失败绝不能影响推送
+                pass
+
+    def journal_add(self, now, kind, d, P, silent, text):
+        """记录一条提醒（时间/类型/方向/提醒价/是否静音/摘要），跨日保留 120 天、最多 600 条；回测与收盘复盘都读它。"""
+        first = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+        j = self.s.setdefault("journal", [])
+        j.append({"t": iso(now), "k": kind, "d": d, "p": round(float(P), 2), "s": bool(silent), "x": first[:80]})
+        cut = now - timedelta(days=120)
+        self.s["journal"] = [x for x in j if (parse_iso(x.get("t")) or now) >= cut][-600:]
 
     def reset_day(self, today: str):
         old = self.s
@@ -919,6 +1031,7 @@ class Engine:
         self.s["notified"] = old.get("notified", {})
         self.s["outbox"] = old.get("outbox", [])
         self.s["greek"] = None
+        self.s["journal"] = old.get("journal", [])
 
     # ---------- 价格基础信息 ----------
     def update_session(self, now, P):
@@ -934,6 +1047,14 @@ class Engine:
         ph.append([ts, P])
         self.s["px_hist"] = [x for x in ph if x[0] >= ts - 95 * 60][-500:]
         self.view["sigma1m"] = realized_sigma_1m_pct(self.s["px_hist"])
+        dp = self.s.setdefault("day_px", [])          # 每分钟最后一个价格，收盘复盘用（约 390 条/天）
+        m0 = int(ts // 60) * 60
+        if dp and dp[-1][0] == m0:
+            dp[-1][1] = round(P, 3)
+        else:
+            dp.append([m0, round(P, 3)])
+            if len(dp) > 1000:
+                del dp[: len(dp) - 1000]
 
     def flip_buffer(self, P) -> float:
         sg = self.view.get("sigma1m")
@@ -1297,7 +1418,7 @@ class Engine:
             if not kind:
                 continue
             text = self.build_confluence(now, P, d, struct_ok, st, mom, flow, count, kind, run)
-            self.queue_push(now, "conf" if kind == "new" else "conf_run", text, silent=False)
+            self.queue_push(now, "conf" if kind == "new" else "conf_run", text, silent=False, P=P, d=d)
             s["last_push"][f"conf_{d}"] = iso(now)
             anchored = any(b["d"] == d for b in s["breaks"])      # 有尚未被收复的真实突破作锚点
             if kind == "new":
@@ -1339,7 +1460,8 @@ class Engine:
                     continue
                 if self.cooldown_ok(now, f"mega_{d}", cfg.mega_cooldown_min):
                     self.s["last_push"][f"mega_{d}"] = iso(now)
-                    self.queue_push(now, "mega", self.build_simple(now, P, "🐋", f"{cfg.symbol} 巨额单", e["text"]), silent=False)
+                    self.queue_push(now, "mega", self.build_simple(now, P, "🐋", f"{cfg.symbol} 巨额单", e["text"]), silent=False,
+                                    P=P, d=d, brief=e["text"])
                 continue
             if d in conf_dirs:
                 continue
@@ -1354,7 +1476,8 @@ class Engine:
             if want and self.cooldown_ok(now, f"single_{kind}_{d}", cfg.single_cooldown_min):
                 self.s["last_push"][f"single_{kind}_{d}"] = iso(now)
                 note = "目前仅为单一信号；动量 / 资金流同向时会另发“共振”提醒"
-                self.queue_push(now, "single", self.build_simple(now, P, "⚡", f"{cfg.symbol} {'结构' if kind in ('flip_cross', 'wall_break') else '信号'}事件", e["text"], note), silent=False)
+                self.queue_push(now, "single", self.build_simple(now, P, "⚡", f"{cfg.symbol} {'结构' if kind in ('flip_cross', 'wall_break') else '信号'}事件", e["text"], note),
+                                silent=False, P=P, d=d, brief=e["text"])
 
     # ---------- 文本构造 ----------
     def levels_lines(self, P) -> str:
@@ -1477,6 +1600,18 @@ class Engine:
         L.append(DISCLAIMER)
         return "\n".join(L)
 
+    def build_review(self, now) -> str:
+        """收盘后另发一条静音消息："今日提醒复盘"（每条提醒按提醒价入场的现货收益）。没有提醒或出错都返回空串。"""
+        s = self.s
+        try:
+            todays = [x for x in (s.get("journal") or []) if x.get("k") in ("conf", "single", "mega")
+                      and (parse_iso(x.get("t")) or now).astimezone(ET).strftime("%Y-%m-%d") == s["date"]]
+            rows, skipped = alert_scorecard(todays, s.get("day_px") or [])
+            lines = scorecard_lines(rows, skipped)
+            return "\n".join(lines + [DISCLAIMER]) if lines else ""
+        except Exception:  # noqa: BLE001
+            return ""
+
     # ---------- 主入口：一个周期 ----------
     def step(self, now, snap) -> dict:
         cfg = self.cfg
@@ -1526,6 +1661,9 @@ class Engine:
             if (closed and s["session"]["was_regular"]) or (now.astimezone(ET).time() >= at):
                 self.queue_push(now, "digest", self.build_close_digest(now), silent=False)
                 s["digest_close"] = True
+                review = self.build_review(now)
+                if review:
+                    self.queue_push(now, "review", review, silent=True)
 
         live_ok = (P is not None) and (not stale) and (not closed)
         if live_ok:
@@ -2423,6 +2561,594 @@ def run_tgtest(cfg: Cfg, tg: Telegram, sleep=time.sleep) -> None:
     log("测试完成。")
 
 
+# ----------------------------------------------------------------------------
+# 回测（MODE=backtest）：① 提醒后"马上入场"的收益  ② 大单分类（买Call/卖Put/买Put/卖Call）之后的 SPY 涨跌
+# ----------------------------------------------------------------------------
+# 2026-11-17 当天实际收到的 11 条提醒（来自 Telegram 记录；时间为 ET，价格为消息里的"现价"；
+# 最后一项 True = 当时已超过当日响铃上限，是静音推送）。d：up=偏多 / down=偏空。
+SEED_ALERTS = [
+    ("2026-11-17", "09:33", "mega", "down", 738.16, False),
+    ("2026-11-17", "09:39", "mega", "up", 738.17, False),
+    ("2026-11-17", "10:19", "mega", "down", 736.51, False),
+    ("2026-11-17", "10:33", "conf", "down", 734.93, False),
+    ("2026-11-17", "10:35", "single", "down", 734.16, False),
+    ("2026-11-17", "10:42", "mega", "up", 731.28, False),
+    ("2026-11-17", "11:01", "conf", "up", 732.21, True),
+    ("2026-11-17", "11:42", "single", "down", 729.93, True),
+    ("2026-11-17", "14:28", "mega", "up", 731.38, True),
+    ("2026-11-17", "14:50", "single", "down", 729.94, True),
+    ("2026-11-17", "15:00", "conf", "down", 728.36, True),
+]
+LABEL_SIGN = {"buy_call": 1, "sell_put": 1, "buy_put": -1, "sell_call": -1}
+
+
+def seed_journal() -> list:
+    out = []
+    for day, hhmm, k, d, p, silent in SEED_ALERTS:
+        y, mo, dd = (int(v) for v in day.split("-"))
+        h, m = (int(v) for v in hhmm.split(":"))
+        out.append({"t": iso(datetime(y, mo, dd, h, m, 0, tzinfo=ET)), "k": k, "d": d, "p": p, "s": silent,
+                    "x": "内置样本", "seed": True})
+    return out
+
+
+def osi_symbol(root: str, day: date, cp: str, strike: float) -> str:
+    """OSI 期权代码，如 SPY261117P00735000（根代码 + YYMMDD + C/P + 行权价×1000 补满 8 位）。"""
+    return f"{root}{day.strftime('%y%m%d')}{cp}{int(round(strike * 1000)):08d}"
+
+
+def et_day(ts) -> date:
+    return datetime.fromtimestamp(ts, ET).date()
+
+
+def session_epochs(day: date):
+    """(开盘 09:30, 回测收盘点 15:55, 收盘 16:00) 的 epoch 秒。"""
+    f = lambda h, m: datetime(day.year, day.month, day.day, h, m, tzinfo=ET).timestamp()  # noqa: E731
+    return f(9, 30), f(15, 55), f(16, 0)
+
+
+def parse_bars(raw) -> list:
+    """UW 的 1 分钟数据（股票 OHLC / 期权 intraday）→ [{t: 分钟起点 epoch 秒, o, h, l, c}]，按时间升序；缺关键字段的行丢弃。"""
+    rows = unwrap(raw)
+    if not isinstance(rows, list):
+        return []
+    out = {}
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        t = parse_iso(r.get("start_time") or r.get("timestamp") or r.get("time"))
+        if t is None:
+            continue
+        o, h, l, c, a = (num(r.get(k)) for k in ("open", "high", "low", "close", "avg_price"))
+        ref = next((x for x in (o, c, a) if x is not None), None)
+        if ref is None:
+            continue
+        o = ref if o is None else o
+        c = o if c is None else c
+        h = max(o, c) if h is None else h
+        l = min(o, c) if l is None else l
+        out[t.timestamp()] = {"t": t.timestamp(), "o": o, "h": h, "l": l, "c": c}
+    return [out[k] for k in sorted(out)]
+
+
+class BarSeries:
+    """按时间排序的分钟线；价格一律取"某分钟起点的开盘价"，缺这一分钟就沿用之前最后一笔成交价（太旧则视为没有）。"""
+
+    def __init__(self, bars):
+        self.bars = bars
+        self.ts = [b["t"] for b in bars]
+
+    def first_at_or_after(self, t, max_gap_s):
+        i = bisect.bisect_left(self.ts, t)
+        if i >= len(self.bars) or self.bars[i]["t"] - t > max_gap_s:
+            return None
+        return i
+
+    def price_at(self, t, max_stale_s=600.0):
+        i = bisect.bisect_left(self.ts, t)
+        if i < len(self.ts) and self.ts[i] == t:
+            return self.bars[i]["o"]
+        j = i - 1
+        if j >= 0 and t - self.ts[j] <= max_stale_s:
+            return self.bars[j]["c"]
+        return None
+
+    def window(self, t0, t1):
+        return self.bars[bisect.bisect_left(self.ts, t0):bisect.bisect_left(self.ts, t1)]
+
+
+def sim_track(ser: BarSeries, t_alert: float, sg: int, delay_min: float, close_t: float, slip: float = 0.0,
+              opt: bool = False, horizons=(5, 15, 30, 60), max_entry_gap_s: float = 300.0):
+    """模拟"提醒后马上入场"：入场 = 提醒之后的下一根分钟线开盘价（再加 delay_min 分钟）。
+    现货（opt=False）：收益 = 方向 sg × 涨跌幅；期权（opt=True，只做多头）：成本 = 入场价 + slip，
+    收益 = (出场价 − slip − 成本) / 成本。出场 = 入场后 +H 分钟（不得晚于 close_t）或 close_t。
+    返回 {t0, entry, cost, ret{H}, close, mfe, mae}（mfe/mae = 入场后 60 分钟内最大有利/不利，%）；无法入场返回 None。"""
+    te = (math.floor(t_alert / 60.0) + 1) * 60.0 + delay_min * 60.0
+    i = ser.first_at_or_after(te, max_entry_gap_s)
+    if i is None:
+        return None
+    t0, e = ser.bars[i]["t"], ser.bars[i]["o"]
+    if t0 >= close_t or e <= 0:
+        return None
+    cost = e + slip if opt else e
+
+    def ret_at(tt):
+        x = ser.price_at(tt)
+        if x is None:
+            return None
+        return (x - slip - cost) / cost * 100.0 if opt else sg * (x - e) / e * 100.0
+
+    out = {"t0": t0, "entry": e, "cost": cost, "ret": {}}
+    for H in horizons:
+        tt = t0 + H * 60.0
+        out["ret"][H] = ret_at(tt) if tt <= close_t else None
+    out["close"] = ret_at(close_t)
+    seg = ser.window(t0, min(t0 + 3600.0, close_t))
+    out["mfe"] = out["mae"] = None
+    if seg:
+        hi, lo = max(b["h"] for b in seg), min(b["l"] for b in seg)
+        if opt:
+            out["mfe"], out["mae"] = (hi - slip - cost) / cost * 100.0, (lo - slip - cost) / cost * 100.0
+        elif sg > 0:
+            out["mfe"], out["mae"] = (hi - e) / e * 100.0, (lo - e) / e * 100.0
+        else:
+            out["mfe"], out["mae"] = (e - lo) / e * 100.0, (e - hi) / e * 100.0
+    return out
+
+
+def fetch_spy_bars(uw, cfg: Cfg, day: date, sleep=time.sleep):
+    """取某一天的 1 分钟线（常规时段）。UW 文档没写清 date / end_date 的行为，所以依次试几种参数写法，取返回该日 K 线最多的一种。"""
+    d_s = day.strftime("%Y-%m-%d")
+    o_t, _c, e_t = session_epochs(day)
+    variants = (("end_date+1D", {"end_date": d_s, "timeframe": "1D", "limit": 2500}),
+                ("date", {"date": d_s, "limit": 2500}),
+                ("end_date", {"end_date": d_s, "limit": 2500}))
+    best, diag = [], []
+    for name, params in variants:
+        r = uw.get(f"/api/stock/{cfg.symbol}/ohlc/1m", params, retries=1)
+        sleep(0.3)
+        if not r.ok:
+            diag.append(f"{name} HTTP {r.status} {(r.err or '')[:90]}".strip())
+            if r.status in (401, 402, 403):          # 权限 / 历史范围问题：换参数没用
+                break
+            continue
+        bars = [b for b in parse_bars(r.data) if o_t <= b["t"] < e_t]
+        diag.append(f"{name} {len(bars)}根" + (f"（返回结构：{shape(r.data)[:120]}）" if not bars else ""))
+        if len(bars) > len(best):
+            best = bars
+        if len(best) >= 380:
+            break
+    return best, diag
+
+
+def fetch_option_bars(uw, osi: str, day: date, sleep=time.sleep):
+    """取某个期权合约某天的 1 分钟成交数据。返回 (bars, 错误说明或 None)。"""
+    d_s = day.strftime("%Y-%m-%d")
+    r = uw.get(f"/api/option-contract/{osi}/intraday", {"date": d_s}, retries=1)
+    sleep(0.3)
+    if not r.ok:
+        return [], f"{osi} HTTP {r.status} {(r.err or '')[:100]}".strip()
+    bars = [b for b in parse_bars(r.data) if et_day(b["t"]) == day]
+    if not bars:
+        return [], f"{osi} 返回 0 根（结构：{shape(r.data)[:120]}）"
+    return bars, None
+
+
+def collect_alerts(cfg: Cfg, state_path: str) -> list:
+    """回测样本 = journal（实盘自动记录）+ 内置的 11-17 样本；只留有方向的、类型在 BT_KINDS 里的；同一分钟同类型同方向只算一条。"""
+    seen, out = set(), []
+
+    def add(a, src):
+        t, p = parse_iso(a.get("t")), num(a.get("p"))
+        if t is None or not p or a.get("d") not in ("up", "down") or a.get("k") not in cfg.bt_kinds:
+            return
+        key = (t.astimezone(ET).strftime("%Y-%m-%d %H:%M"), a.get("k"), a.get("d"))
+        if key in seen:
+            return
+        seen.add(key)
+        out.append({**a, "tt": t.timestamp(), "p": p, "src": src})
+
+    try:
+        st = load_state(state_path)
+    except Exception:  # noqa: BLE001
+        st = {}
+    for a in (st.get("journal") or []):
+        add(a, "journal")
+    if cfg.bt_seed:
+        for a in seed_journal():
+            add(a, "seed")
+    out.sort(key=lambda x: x["tt"])
+    return out
+
+
+def run_alert_backtest(cfg: Cfg, uw, alerts: list, series_for, sleep=time.sleep):
+    results, opt_cache = [], {}
+    days = sorted({et_day(a["tt"]) for a in alerts})
+    for a in alerts:
+        day = et_day(a["tt"])
+        _o, close_t, _e = session_epochs(day)
+        sg = 1 if a["d"] == "up" else -1
+        res = {"a": a}
+        ser = series_for(day)
+        if ser is None:
+            res["err"] = "没有取到当天的 SPY 分钟线"
+        else:
+            res["spot"] = sim_track(ser, a["tt"], sg, cfg.bt_delay_min, close_t)
+            if res["spot"] is None:
+                res["err"] = "提醒太靠近收盘或分钟线缺失，无法入场"
+        cp = "C" if sg > 0 else "P"
+        strike = float(math.floor(a["p"] + 0.5))                    # 最接近平值的整数行权价
+        osi = osi_symbol(cfg.symbol, day, cp, strike)
+        res["osi"], res["lab"] = osi, f"{cp}{strike:g}"
+        if osi not in opt_cache:
+            opt_cache[osi] = fetch_option_bars(uw, osi, day, sleep)
+        bars, err = opt_cache[osi]
+        if bars:
+            res["opt"] = sim_track(BarSeries(bars), a["tt"], 1, cfg.bt_delay_min, close_t, slip=cfg.bt_slip, opt=True)
+            if res["opt"] is None:
+                res["opt_err"] = "提醒后 5 分钟内该合约没有成交，无法入场"
+        else:
+            res["opt_err"] = err
+        results.append(res)
+    return results, days
+
+
+def _po(x) -> str:
+    if x is None:
+        return "—"
+    return f"{x:+.0f}%" if abs(x) >= 10 else f"{x:+.1f}%"
+
+
+def build_backtest_report(cfg: Cfg, results: list, days: list, diag: list) -> list:
+    HZ = (5, 15, 30, 60)
+    L = [f"📊 提醒回测 · {len(results)} 条提醒｜{days[0]}～{days[-1]}",
+         "入场：提醒之后的下一根 1 分钟线开盘价" + (f"，再延后 {cfg.bt_delay_min:g} 分钟" if cfg.bt_delay_min else "")
+         + "；出场：入场后 +5/+15/+30/+60 分钟，或 15:55",
+         f"现货：按提醒方向做多/做空 SPY｜期权：同方向、最接近平值的 0DTE（买 Call 或买 Put），买入和卖出各扣 ${cfg.bt_slip:.2f}/股滑点，未含手续费"]
+
+    def block(title, tracks, fmt):
+        L.append(title)
+        if not tracks:
+            L.append("  （没有可用数据）")
+            return
+        for h in HZ:
+            n, w, m, md = _agg([t["ret"].get(h) for t in tracks])
+            if n:
+                L.append(f"  +{h}分钟：赢 {w}/{n}｜平均 {fmt(m)}｜中位 {fmt(md)}")
+        n, w, m, md = _agg([t["close"] for t in tracks])
+        if n:
+            L.append(f"  到15:55：赢 {w}/{n}｜平均 {fmt(m)}｜中位 {fmt(md)}")
+        mf = [t["mfe"] for t in tracks if t.get("mfe") is not None]
+        ma = [t["mae"] for t in tracks if t.get("mae") is not None]
+        if mf and ma:
+            L.append(f"  入场后60分钟内：最大有利均值 {fmt(sum(mf) / len(mf))}｜最大不利均值 {fmt(sum(ma) / len(ma))}")
+
+    spot = [r["spot"] for r in results if r.get("spot")]
+    opt = [r["opt"] for r in results if r.get("opt")]
+    block(f"【现货 SPY｜可回测 {len(spot)}/{len(results)} 条】", spot, _pc)
+    block(f"【期权 0DTE 平值｜可回测 {len(opt)}/{len(results)} 条｜含滑点】", opt, _po)
+    kinds = []
+    for k in ("conf", "single", "mega"):
+        sub = [r for r in results if r["a"]["k"] == k]
+        if not sub:
+            continue
+        sp = _agg([(r.get("spot") or {}).get("ret", {}).get(60) for r in sub])
+        op = _agg([(r.get("opt") or {}).get("ret", {}).get(60) for r in sub])
+        kinds.append(f"  {KIND_ICON[k]}{KIND_NAME[k]} {len(sub)}条｜现货+60m 赢{sp[1]}/{sp[0]} 均{_pc(sp[2])}｜期权+60m 赢{op[1]}/{op[0]} 均{_po(op[2])}")
+    if kinds:
+        L.append("【按类型（+60分钟）】")
+        L.extend(kinds)
+    L.append("【逐条】（🔕=当时已超过响铃上限、是静音推送）")
+    for r in results:
+        a = r["a"]
+        when = datetime.fromtimestamp(a["tt"], ET).strftime("%m-%d %H:%M")
+        tag = f"{'▲' if a['d'] == 'up' else '▼'}{KIND_ICON.get(a['k'], '')}{'🔕' if a.get('s') else ''}"
+        sp, op = r.get("spot"), r.get("opt")
+        s_txt = f"现货60m {_pc(sp['ret'].get(60))}" if sp else "现货无数据"
+        if op:
+            rr = op["ret"]
+            L.append(f"{when} {tag} {r['lab']}@{op['entry']:.2f}｜15m {_po(rr.get(15))}｜30m {_po(rr.get(30))}｜60m {_po(rr.get(60))}"
+                     f"｜15:55 {_po(op['close'])}｜60分钟内最好 {_po(op['mfe'])} 最差 {_po(op['mae'])}｜{s_txt}")
+        else:
+            L.append(f"{when} {tag} {r['lab']} 期权无数据（{(r.get('opt_err') or r.get('err') or '')[:70]}）｜{s_txt}")
+    L.append("提示：「最好/最差」= 入场后60分钟内曾到过的最高/最低收益（不代表你一定能在那个价位成交）；1 张合约 = 100 股；"
+             "期权用的是成交价而不是买卖报价，实际点差可能更大；样本很少，仅供参考。")
+    if diag:
+        L.append("【数据诊断】")
+        L.extend(f"  {x}" for x in diag)
+    return L
+
+
+def fetch_flow_history(uw, cfg: Cfg, t_start: float, t_end: float, sleep=time.sleep, max_pages: int = 14):
+    """从 t_end 往前翻页取 flow-alerts（每页 500 条，older_than = 本页最早一条的时间），直到越过 t_start。返回 (按时间升序的列表, 诊断)。"""
+    rows, diag, cursor = {}, [], t_end
+    for page in range(max_pages):
+        params = {"ticker_symbol": cfg.symbol, "limit": 500, "min_premium": int(cfg.print_min),
+                  "newer_than": int(t_start), "older_than": int(cursor)}
+        r = uw.get("/api/option-trades/flow-alerts", params, retries=1)
+        sleep(0.3)
+        if not r.ok:
+            diag.append(f"flow-alerts 第{page + 1}页 HTTP {r.status} {(r.err or '')[:90]}".strip())
+            break
+        items = parse_flow(r.data, date.today()) or []
+        if not items:
+            diag.append(f"flow-alerts 第{page + 1}页 0条")
+            break
+        fresh = [x for x in items if x["key"] not in rows]
+        for x in items:
+            rows[x["key"]] = x
+        diag.append(f"flow-alerts 第{page + 1}页 {len(items)}条（新增{len(fresh)}）")
+        oldest = items[0]["tdt"].timestamp()
+        if len(items) < 500 or oldest <= t_start or not fresh:
+            break
+        cursor = oldest
+    out = [x for x in rows.values() if t_start <= x["tdt"].timestamp() <= t_end]
+    out.sort(key=lambda x: x["tdt"])
+    return out, diag
+
+
+def flow_study_rows(items: list, series_for, horizons=(5, 15, 30, 60)) -> list:
+    """每条大单：分类 + 它生成后（下一分钟开盘价起）SPY 的涨跌幅（原始涨跌，不按方向调整）。开盘前 5 分钟和收盘前 5 分钟的不看。"""
+    rows = []
+    for it in items:
+        te = it["tdt"].timestamp()
+        day = et_day(te)
+        ser = series_for(day)
+        if ser is None:
+            continue
+        o_t, c_t, _e = session_epochs(day)
+        if te < o_t + 300 or te > c_t - 300:
+            continue
+        tr = sim_track(ser, te, 1, 0.0, c_t, horizons=horizons)
+        if not tr:
+            continue
+        dte = None
+        if it.get("expiry"):
+            try:
+                dte = (date.fromisoformat(it["expiry"]) - day).days
+            except ValueError:
+                dte = None
+        rows.append({"day": day, "cat": mix_key(it.get("type"), it.get("side")), "prem": it["prem"],
+                     "delta": it.get("delta"), "opening": bool(it.get("opening")), "multileg": bool(it.get("multileg")),
+                     "dte": dte, "r": tr["ret"]})
+    return rows
+
+
+DTE_BUCKETS = ("0DTE", "1–5天", "6–30天", "30天+", "未知")
+
+
+def dte_bucket(dte) -> str:
+    """到期天数分档：0DTE / 1–5 天 / 6–30 天 / 30 天以上；取不到到期日 = 未知。"""
+    if dte is None:
+        return "未知"
+    if dte <= 0:
+        return "0DTE"
+    if dte <= 5:
+        return "1–5天"
+    if dte <= 30:
+        return "6–30天"
+    return "30天+"
+
+
+def _study_stats(rows: list, H: int) -> dict:
+    mv = [r["r"].get(H) for r in rows if r["r"].get(H) is not None]
+    lab = [r["r"][H] * LABEL_SIGN[r["cat"]] for r in rows if r["cat"] in LABEL_SIGN and r["r"].get(H) is not None]
+    return {"n": len(mv), "nl": len(lab), "mv": (sum(mv) / len(mv)) if mv else None,
+            "lab": (sum(lab) / len(lab)) if lab else None,
+            "win": (100.0 * sum(1 for x in lab if x > 0) / len(lab)) if lab else None}
+
+
+def _pw(x) -> str:
+    return "—" if x is None else f"{x:.0f}%"
+
+
+FLOW_TIERS = (250_000, 500_000, 1_000_000, 5_000_000)       # 金额档（累计）：≥25万 / ≥50万 / ≥100万 / ≥500万
+
+
+def flow_matrix_lines(cfg: Cfg, rows: list, kind: str) -> list:
+    """金额档 × 到期档：买入型（kind="buy"）或卖出型（"sell"）、非深实值、非多腿的大单，之后 5/15/30 分钟的
+    标签收益、胜率、多空差。金额档是累计的（≥50万 包含 ≥100万、≥500万 的那些），对应"如果门槛设在这里，会看到什么"。
+    到期档 = 0DTE / 1–5天 / 6–30天 / 30天+（日历天数）。每天 = 平均每天条数（按样本里有数据的天数算）。n<10 不统计。"""
+    up_cat, dn_cat = ("buy_call", "buy_put") if kind == "buy" else ("sell_put", "sell_call")
+    base = [r for r in rows if r["cat"] in (up_cat, dn_cat) and not r["multileg"]
+            and not (r["delta"] is not None and abs(r["delta"]) >= cfg.bt_deep)]
+    ndays = len({r["day"] for r in rows}) or 1
+    out = []
+    for bucket in DTE_BUCKETS[:4]:
+        grp = [r for r in base if dte_bucket(r["dte"]) == bucket]
+        out.append(f"  到期 {bucket}")
+        for v in FLOW_TIERS:
+            sub = [r for r in grp if (r["prem"] or 0) >= v]
+            n = len(sub)
+            head = f"   ≥{v / 10000:g}万 n={n}（{n / ndays:.1f}/天）"
+            if n < 10:
+                out.append(head + "｜样本不足")
+                continue
+            lab, win = [], []
+            for H in (5, 15, 30):
+                st = _study_stats(sub, H)
+                lab.append(f"{H}m {_pc(st['lab'])}")
+                win.append(f"{H}m {_pw(st['win'])}")
+            spread = "—"
+            a, d = [r for r in sub if r["cat"] == up_cat], [r for r in sub if r["cat"] == dn_cat]
+            if len(a) >= 5 and len(d) >= 5:
+                x, y = _study_stats(a, 15)["mv"], _study_stats(d, 15)["mv"]
+                if x is not None and y is not None:
+                    spread = _pc(x - y)
+            out.append(head + "｜标签收益 " + " ".join(lab) + "｜胜率 " + " ".join(win) + f"｜多空差15m {spread}")
+    return out
+
+
+def build_flow_study_report(cfg: Cfg, rows: list, days: list, n_items: int, diag: list) -> list:
+    L = [f"🔬 大单分类回测 · {days[0]}～{days[-1]}｜≥{money(cfg.print_min)} 的大单 {n_items} 条（可用 {len(rows)} 条）",
+         "每条大单从生成后的下一分钟 SPY 开盘价算起，看之后 5/15/30/60 分钟 SPY 实际涨跌（%）。",
+         "「标签收益」= 按买卖标签的多空方向调整后的涨跌（买Call/卖Put 当多，买Put/卖Call 当空）；标签真有方向信息的话，它应明显大于 0、胜率应明显高于 50%。"]
+    base = {H: _study_stats(rows, H)["mv"] for H in (5, 15, 30, 60)}
+    L.append("基准（所有大单时点的 SPY 平均涨跌）：" + "｜".join(f"+{H}m {_pc(base[H])}" for H in (5, 15, 30, 60)))
+
+    # 到期分布：这些大单到底是多少天到期的（提醒目前没有到期日限制）
+    def dte_dist(sub):
+        cnt = {k: 0 for k in DTE_BUCKETS}
+        prm = {k: 0.0 for k in DTE_BUCKETS}
+        for r in sub:
+            b = dte_bucket(r["dte"])
+            cnt[b] += 1
+            prm[b] += r["prem"] or 0.0
+        return cnt, prm
+
+    cnt, prm = dte_dist(rows)
+    tot_n, tot_p = sum(cnt.values()), sum(prm.values())
+    if tot_n:
+        by_n = "｜".join(f"{k} {100.0 * cnt[k] / tot_n:.0f}%" for k in DTE_BUCKETS if cnt[k])
+        by_p = "｜".join(f"{k} {100.0 * prm[k] / tot_p:.0f}%" for k in DTE_BUCKETS if prm[k]) if tot_p else "—"
+        L.append(f"【到期分布】≥{money(cfg.print_min)} 大单 n={tot_n}｜按条数 {by_n}｜按权利金 {by_p}")
+        big = [r for r in rows if (r["prem"] or 0) >= cfg.mega_min]
+        if big:
+            c2, _p2 = dte_dist(big)
+            L.append(f"  其中 ≥{money(cfg.mega_min)} 的巨额单 n={len(big)}：" + "｜".join(f"{k} {c2[k]}条" for k in DTE_BUCKETS if c2[k]))
+    L.append("【按类别】涨跌 = SPY 平均涨跌；标签 = 标签收益；胜 = 标签方向猜对的比例")
+    for k, label in MIX_LABEL[:4]:
+        sub = [r for r in rows if r["cat"] == k]
+        if len(sub) < 5:
+            continue
+        parts = []
+        for H in (15, 60):
+            st = _study_stats(sub, H)
+            parts.append(f"{H}m 涨跌 {_pc(st['mv'])} 标签 {_pc(st['lab'])} 胜{_pw(st['win'])}")
+        L.append(f"  {label} n={len(sub)}｜" + "｜".join(parts))
+    for a, b, name in (("buy_call", "buy_put", "买Call − 买Put"), ("sell_put", "sell_call", "卖Put − 卖Call")):
+        sa, sb = [r for r in rows if r["cat"] == a], [r for r in rows if r["cat"] == b]
+        if len(sa) >= 5 and len(sb) >= 5:
+            ds = []
+            for H in (15, 60):
+                x, y = _study_stats(sa, H)["mv"], _study_stats(sb, H)["mv"]
+                ds.append(f"{H}m {_pc(x - y) if x is not None and y is not None else '—'}")
+            L.append(f"  多空区分度 {name}：" + "｜".join(ds) + "（>0 = “偏多”标签之后 SPY 涨得更多）")
+
+    def is_buy(r):
+        return r["cat"] in ("buy_call", "buy_put")
+
+    def is_sell(r):
+        return r["cat"] in ("sell_put", "sell_call")
+
+    def deep(r):
+        return r["delta"] is not None and abs(r["delta"]) >= cfg.bt_deep
+
+    groups = [
+        ("买入型·非深实值·非多腿", lambda r: is_buy(r) and not deep(r) and not r["multileg"]),
+        ("买入型·深实值", lambda r: is_buy(r) and deep(r)),
+        ("卖出型·非深实值·非多腿", lambda r: is_sell(r) and not deep(r) and not r["multileg"]),
+        ("卖出型·深实值", lambda r: is_sell(r) and deep(r)),
+        ("含多腿成交", lambda r: r["multileg"]),
+        ("全为开仓", lambda r: r["opening"]),
+        ("到期 0DTE", lambda r: dte_bucket(r["dte"]) == "0DTE"),
+        ("到期 1–5天", lambda r: dte_bucket(r["dte"]) == "1–5天"),
+        ("到期 6–30天", lambda r: dte_bucket(r["dte"]) == "6–30天"),
+        ("到期 30天+", lambda r: dte_bucket(r["dte"]) == "30天+"),
+        # 方案 B 里“只保留这一类做方向证据”的候选规则：买入型、非深实值、非多腿、5 天内到期
+        ("候选规则·买入型·非深实值·非多腿·≤5天到期",
+         lambda r: is_buy(r) and not deep(r) and not r["multileg"] and dte_bucket(r["dte"]) in ("0DTE", "1–5天")),
+    ]
+    L.append(f"【分层】（深实值 = |Δ|≥{cfg.bt_deep:g}；只列有方向标签的 ≥20 条）")
+    for name, fn in groups:
+        sub = [r for r in rows if fn(r)]
+        s15, s60 = _study_stats(sub, 15), _study_stats(sub, 60)
+        if s60["nl"] >= 20:
+            L.append(f"  {name} n={s60['nl']}｜标签收益 15m {_pc(s15['lab'])} 60m {_pc(s60['lab'])}｜60m 胜{_pw(s60['win'])}")
+    for kind, title, note in (
+            ("buy", "买入型", "标签收益 = 买Call 算多、买Put 算空调整后的 SPY 涨跌；多空差 = 买Call 之后与买Put 之后 SPY 平均涨跌之差，>0 才说明方向有用"),
+            ("sell", "卖出型", "卖Put 算多、卖Call 算空；标签收益≈0 或为负、多空差≤0，就说明卖出型不该当方向用")):
+        L.append(f"【{title}·非深实值·非多腿｜金额档 × 到期档】（金额档累计；每天 = 平均每天条数；n<10 不统计）")
+        L.append(f"  {note}")
+        L.extend(flow_matrix_lines(cfg, rows, kind))
+    for name, fn in (("买入型", is_buy), ("卖出型", is_sell)):
+        per = []
+        for day in days:
+            st = _study_stats([r for r in rows if r["day"] == day and fn(r)], 60)
+            if st["nl"] >= 10:
+                per.append(f"{day:%m-%d} {_pc(st['lab'])}")
+        if per:
+            L.append(f"【{name} 60分钟标签收益·按天】" + "｜".join(per))
+    L.append("提示：同一时段会连着出很多条大单，样本高度重叠，有效样本远小于条数；n 不到 30 的格子、只有几天的数据，只能当线索，不能当结论。")
+    if diag:
+        L.append("【数据诊断】")
+        L.extend(f"  {x}" for x in diag)
+    return L
+
+
+def send_lines(tg, lines: list, limit: int = 3500) -> list:
+    msgs, cur = [], ""
+    for ln in lines:
+        if cur and len(cur) + len(ln) + 1 > limit:
+            msgs.append(cur)
+            cur = ""
+        cur += ("\n" if cur else "") + ln
+    if cur:
+        msgs.append(cur)
+    for m in msgs:
+        if tg.send(m, silent=False) is None:
+            log("Telegram 发送失败：", tg.last_error)
+    return msgs
+
+
+def recent_trading_days(now: datetime, n: int) -> list:
+    """最近 n 个已收盘（或今天 16:10 之后）的工作日，升序。节假日会因取不到数据而被自动跳过。"""
+    t = now.astimezone(ET)
+    d, out = t.date(), []
+    if t.weekday() >= 5 or t.time() < dtime(16, 10):
+        d -= timedelta(days=1)
+    while len(out) < n:
+        if d.weekday() < 5:
+            out.append(d)
+        d -= timedelta(days=1)
+    return sorted(out)
+
+
+def run_backtest(cfg: Cfg, uw, tg, sleep=time.sleep, state_path: str = STATE_FILE, now_fn=now_et) -> None:
+    now = now_fn()
+    series_cache: dict = {}
+    spy_diag: dict = {}
+
+    def series_for(day):
+        if day not in series_cache:
+            bars, dg = fetch_spy_bars(uw, cfg, day, sleep)
+            series_cache[day] = BarSeries(bars) if len(bars) >= 100 else None
+            spy_diag[day] = f"{day:%m-%d} SPY 1分钟线：" + "｜".join(dg)
+        return series_cache[day]
+
+    # ① 提醒回测：journal + 内置样本
+    alerts = collect_alerts(cfg, state_path)
+    if alerts:
+        results, days = run_alert_backtest(cfg, uw, alerts, series_for, sleep)
+        diag = [spy_diag[d] for d in days if d in spy_diag]
+        diag += [r["opt_err"] for r in results if r.get("opt_err") and "无法入场" not in r["opt_err"]][:6]
+        send_lines(tg, build_backtest_report(cfg, results, days, diag))
+    else:
+        tg.send("ℹ️ 提醒回测｜没有可回测的提醒（journal 里还没有记录，且内置样本已关闭）", silent=False)
+
+    # ② 大单分类回测：最近几个交易日的 UW flow-alerts × SPY 分钟线
+    if cfg.bt_flow_days > 0:
+        try:
+            fdays = recent_trading_days(now, cfg.bt_flow_days)
+            t_start = datetime(fdays[0].year, fdays[0].month, fdays[0].day, 9, 25, tzinfo=ET).timestamp()
+            t_end = min(datetime(fdays[-1].year, fdays[-1].month, fdays[-1].day, 16, 20, tzinfo=ET).timestamp(), now.timestamp())
+            items, fdiag = fetch_flow_history(uw, cfg, t_start, t_end, sleep)
+            if not items:
+                tg.send("ℹ️ 大单分类回测｜没有取到大单记录\n" + "\n".join(fdiag), silent=False)
+                return
+            rows = flow_study_rows(items, series_for)
+            if len(rows) < 20:
+                tg.send(f"ℹ️ 大单分类回测｜取到 {len(items)} 条大单，但能配上 SPY 分钟线的只有 {len(rows)} 条，样本不足\n"
+                        + "\n".join(fdiag + [v for v in spy_diag.values()]), silent=False)
+                return
+            sdays = sorted({r["day"] for r in rows})
+            send_lines(tg, build_flow_study_report(cfg, rows, sdays, len(items),
+                                                   fdiag + [spy_diag[d] for d in sdays if d in spy_diag]))
+        except Exception as e:  # noqa: BLE001
+            log("大单分类回测出错：", type(e).__name__, e)
+            tg.send(f"⚠ 大单分类回测出错：{type(e).__name__}（提醒回测结果已发送，不受影响）", silent=False)
+
+
 def main() -> None:
     cfg = Cfg()
     SECRETS.extend([cfg.uw_key, cfg.tg_token, cfg.tg_chat])
@@ -2439,6 +3165,9 @@ def main() -> None:
     uw = UW(cfg.uw_key)
     if cfg.mode == "probe":
         run_probe(cfg, uw, tg)
+        return
+    if cfg.mode == "backtest":
+        run_backtest(cfg, uw, tg)
         return
     run_monitor(cfg, uw, tg)
 
