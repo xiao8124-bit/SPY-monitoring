@@ -7,18 +7,20 @@ name: UW SPY Monitor
 #   1) cron-job.org 每 15 分钟 POST 一次 workflow_dispatch（主触发，准点）
 #      网址：https://api.github.com/repos/<你的用户名>/<仓库名>/actions/workflows/uw_monitor.yml/dispatches
 #   2) 下面的 schedule 是 GitHub 自带定时器，只作“万一 cron-job.org 失效”的兜底（可能延迟几分钟）
-#   3) 在 Actions 页面手动 Run workflow，可选 mode：monitor / probe / telegram-test
+#   3) 在 Actions 页面手动 Run workflow，可选 mode：monitor / probe / telegram-test / backtest
+#      backtest = 提醒回测：用 UW 的 1 分钟行情，把历史提醒“按提醒时间入局”重算一遍，结果发到 Telegram（不影响监控状态）
 # 两个触发源同时存在也没问题：concurrency 保证同一时间只有 1 个监控任务在跑，多出来的排队任务会被自动取消。
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "运行模式：monitor=正常监控｜probe=探测 UW 接口并发到 Telegram｜telegram-test=只测试 Telegram 推送"
+        description: "运行模式：monitor=正常监控｜probe=探测 UW 接口并发到 Telegram｜telegram-test=只测试 Telegram 推送｜backtest=提醒回测（结果发到 Telegram）"
         type: choice
         options:
           - monitor
           - probe
           - telegram-test
+          - backtest
         default: monitor
       force_run:
         description: "monitor 模式下，非交易时段也强制跑一轮（测试用，不保存状态）"
@@ -33,9 +35,9 @@ run-name: UW ${{ inputs.mode || 'monitor' }} · ${{ github.event_name }}
 permissions:
   contents: write
 
-# 手动测试（probe / telegram-test）用单独的队列，不用等正在运行的监控任务
+# 手动测试（probe / telegram-test / backtest）用单独的队列，不用等正在运行的监控任务，也不会挤掉监控任务
 concurrency:
-  group: ${{ (inputs.mode == 'probe' || inputs.mode == 'telegram-test') && 'uw-manual' || 'uw-monitor' }}
+  group: ${{ (inputs.mode == 'probe' || inputs.mode == 'telegram-test' || inputs.mode == 'backtest') && 'uw-manual' || 'uw-monitor' }}
   cancel-in-progress: false
 
 jobs:
@@ -79,6 +81,10 @@ jobs:
           IMPULSE_PCT: ${{ vars.IMPULSE_PCT }}
           FLIP_BUFFER: ${{ vars.FLIP_BUFFER }}
           WALL_BUFFER: ${{ vars.WALL_BUFFER }}
+          # 回测专用（只在 mode=backtest 时用到）：滑点（美元/张，默认 0.03）、入场延迟（分钟，默认 0）、大单分类回测天数（默认 5，0=不做）
+          BT_SLIPPAGE: ${{ vars.BT_SLIPPAGE }}
+          BT_DELAY_MIN: ${{ vars.BT_DELAY_MIN }}
+          BT_FLOW_DAYS: ${{ vars.BT_FLOW_DAYS }}
           DEBUG: ${{ vars.DEBUG }}
         run: python uw_monitor.py
 
