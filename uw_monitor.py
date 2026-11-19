@@ -7,10 +7,18 @@ SPY 期权结构 + 资金流 实时监控（Unusual Whales API）→ Telegram
   monitor        正式监控：美股常规时段内每 15 秒轮询一次，维护"实时面板"（同一条 Telegram 消息原地刷新、静音）；
                  只在"共振"（结构/动量/资金流 ≥2 类同向）或关键结构事件、巨额单时才推送带提示音的消息；15:55 ET 发收盘摘要
                  （摘要里含"今日提醒复盘"：每条提醒按提醒价入场的现货收益）。每条推送都会记入 uw_state.json 的 journal，供回测使用。
-  probe          接口探测：逐个调用 UW 接口，把状态码、字段结构、解析结果和大单频率统计发到 Telegram（首次部署用）。
+  probe          接口探测：逐个调用 UW 接口，把状态码、字段结构、解析结果和大单频率统计发到 Telegram（首次部署用）；
+                 另有"新数据流检查"：0DTE 按行权价 gamma、Greek flow、NOPE、成交量价位、按行权价盘中流向 是否可用、数据口径、最远能往回查多久。
   telegram-test  推送测试：发一条消息再编辑它，验证 Bot 与"原地刷新"功能。
-  backtest       提醒回测：读取内置样本（2026-11-17 的 11 条提醒）和 journal 里记录的真实提醒，用 UW 的 SPY 分钟线和
-                 0DTE 平值期权的分钟成交价，算"提醒后马上入场"在 +5/+15/+30/+60 分钟和 15:55 的收益、60 分钟内最好/最差收益，发到 Telegram。
+  backtest       研究报告（依次发三条：结论页 → 要点页 → 附录；只有结论页带提示音），每一项给出 🟢有线索 / ⚪没看出优势 / 🟡样本不足 / ➖没测 / ⚠读不到 的标记：
+                 ① 提醒入场：内置样本（2026-11-17 的 11 条提醒）+ journal 里记录的真实提醒，用 SPY 分钟线和 0DTE 平值期权的分钟成交价，
+                    算"提醒后马上入场"在 +5/+15/+30/+60 分钟和 15:55 的收益、60 分钟内最好/最差收益（含滑点）；
+                 ② 大单买卖标签：偏多标签（买Call/卖Put）之后 SPY 是不是比偏空标签之后涨得多（"多空差"，基本抵消当天趋势）；
+                 ③ Greek flow（全部到期 / 当天到期）与 NOPE：近 15 分钟的方向性 delta 流，能不能领先之后 5/15/30/60 分钟的 SPY 涨跌（秩相关 + 噪声范围 + 按天一致性）；
+                 ④ 前一日成交量价位（POC / 价值区上下沿）：价格第一次碰到之后，反弹得比"平移后的假价位"更多吗；
+                 ⑤ 0DTE 按行权价 gamma：历史接口只给当天最后一个快照，回测会带入未来信息，所以只说明原因、不测。
+                 环境变量：BT_FLOW_DAYS（回看几个交易日，默认 5；0 = 只跑 ① 提醒回测）、BT_STREAM_SECONDS（③④ 取数据的时间预算，默认 540 秒）。
+                 回测只检验"信号有没有预测力"，不改变面板和提醒的任何逻辑。
 
 信号三类（同向 ≥2 类才算"共振"）：
   结构   价格"确认"穿过 Flip 区（持续 60 秒）/ 确认突破 Call Wall、Put Wall（持续 45 秒）；
@@ -197,6 +205,7 @@ class Cfg:
         self.bt_seed = b("BT_SEED", True)             # 是否包含内置的 2026-11-17 样本
         self.bt_flow_days = int(f("BT_FLOW_DAYS", 5))  # "大单分类回测"回看最近几个交易日；0 = 不做
         self.bt_deep = f("BT_DEEP_DELTA", 0.6)        # |delta| ≥ 此值视为"深实值"
+        self.bt_stream_s = f("BT_STREAM_SECONDS", 540)  # 新数据流检验（Greek flow / NOPE / 价值区）的时间预算（秒）；用完就只用已取到的天数
 
 
 # ----------------------------------------------------------------------------
@@ -2340,14 +2349,17 @@ def spot_series_report(rows) -> str:
 
 
 def parse_greek_flow(raw):
-    """/greek-flow（分钟级 delta / vega 流向）→ [{t, dd, dv, td, tv}]：dd/dv=方向性(dir) delta/vega 流，td/tv=总量。"""
+    """/greek-flow（分钟级 delta / vega 流向；也适用于按到期日的 /greek-flow/{expiry}）→ [{t, dd, dv, td, tv, odd, otd, vol, tx}]：
+    dd/dv=方向性(dir) delta/vega 流，td/tv=总量，odd/otd=价外(OTM)的方向性/总 delta 流，vol=期权成交量，tx=成交笔数。"""
     out = []
     for r in _data_rows(raw):
         t = _any_ts(r.get("timestamp")) or _any_ts(r.get("time"))
         if t is None:
             continue
         out.append({"t": t, "dd": num(r.get("dir_delta_flow")), "dv": num(r.get("dir_vega_flow")),
-                    "td": num(r.get("total_delta_flow")), "tv": num(r.get("total_vega_flow"))})
+                    "td": num(r.get("total_delta_flow")), "tv": num(r.get("total_vega_flow")),
+                    "odd": num(r.get("otm_dir_delta_flow")), "otd": num(r.get("otm_total_delta_flow")),
+                    "vol": num(r.get("volume")), "tx": num(r.get("transactions"))})
     out.sort(key=lambda x: x["t"])
     return out or None
 
@@ -2406,6 +2418,183 @@ def run_probe_extras(cfg: Cfg, uw: UW, price, now_u, uw_levels=None) -> list:
             out.append(f"⚠ {name} 解析异常 {type(e).__name__}")
     out.insert(0, f"🧩 扩展接口检查（按行权价 gamma 用于计算墙位，其余为后续功能做准备）｜{ok}/{len(specs)} 项可用")
     return out
+
+
+# ---- 新数据流探针：接口是否可用、返回什么、能往回查多久（研究报告用这些数据，字段含义以这里的实测为准） ----
+def probe_depth(call_fn, today: date, offsets=(30, 90, 180, 365, 540, 730), sleep=time.sleep) -> str:
+    """同一个接口往回试几个日期，看最远能查多久（取不到数据时再试前一个工作日，排除休市日）。"""
+    parts = []
+    for off in offsets:
+        d = today - timedelta(days=off)
+        while d.weekday() >= 5:
+            d -= timedelta(days=1)
+        res = f"{off}天?"
+        for _attempt in range(2):
+            r = call_fn(d)
+            sleep(0.3)
+            if not r.ok:
+                res = f"{off}天❌{r.status}" + (f"({r.code[:30]})" if r.code else "")
+                break
+            if _data_rows(r.data):
+                res = f"{off}天✅"
+                break
+            res = f"{off}天∅"
+            d -= timedelta(days=1)
+            while d.weekday() >= 5:
+                d -= timedelta(days=1)
+        parts.append(res)
+    return "往回查：" + " ".join(parts) + "（∅ = 返回了但没有数据，可能休市）"
+
+
+def _fmt_vals(vals: list, n: int = 3) -> str:
+    return " ".join(f"{v:,.0f}" if abs(v) >= 100 else f"{v:.3g}" for v in vals[:n])
+
+
+def probe_gamma_lines(raw) -> list:
+    rows = _data_rows(raw)
+    if not rows:
+        return ["返回 0 行（结构见字段结构）"]
+    agg: dict = {}
+    for r in rows:
+        k = num(r.get("strike"))
+        if k is None:
+            continue
+        a = agg.setdefault(k, [0.0, 0.0])
+        a[0] += num(r.get("call_gamma_oi")) or 0.0
+        a[1] += num(r.get("put_gamma_oi")) or 0.0
+    ts = [t for t in (_any_ts(r.get("time")) for r in rows) if t]
+    px = sorted(x for x in (num(r.get("price")) for r in rows) if x)
+    top = sorted(agg.items(), key=lambda kv: -(abs(kv[1][0]) + abs(kv[1][1])))[:5]
+    when = f"｜快照 {hmd(min(ts))}→{hmd(max(ts))} ET" if ts else ""
+    L = [f"{len(rows)} 行｜行权价 {min(agg):g}–{max(agg):g}（{len(agg)} 个）｜price {px[len(px) // 2]:g}{when}｜行内带 expiry 字段：{'是' if 'expiry' in rows[0] else '否'}"
+         if agg else f"{len(rows)} 行，但读不到 strike"]
+    if top:
+        L.append("gamma(OI) 最大的 5 个行权价：" + "｜".join(f"{k:g}（C {money(c, True).replace('$', '')} / P {money(p, True).replace('$', '')}）" for k, (c, p) in top))
+    return L
+
+
+def probe_gf_lines(raw) -> list:
+    rows = parse_greek_flow(raw)
+    if not rows:
+        return ["解析不到行（结构见字段结构）"]
+    rth = [x for x in rows if is_rth(x["t"])]
+    vals = [x["dd"] for x in rth if x["dd"] is not None]
+    ac = lag1_autocorr(vals)
+    how = "无法判定" if ac is None else ("当天累计值" if ac >= 0.9 else "逐分钟增量")
+    L = [f"{len(rows)} 行（常规时段 {len(rth)}）｜{hmd(rows[0]['t'])}→{hmd(rows[-1]['t'])} ET｜dir_delta_flow 判定：{how}"
+         + (f"（相邻自相关 {ac:.2f}）" if ac is not None else "")]
+    if vals:
+        mid = len(vals) // 2
+        L.append(f"dir_delta_flow 前3/中3/末3：{_fmt_vals(vals)} ｜ {_fmt_vals(vals[mid:])} ｜ {_fmt_vals(vals[-3:])}"
+                 f"｜合计 {sum(vals):,.0f}｜单分钟波动 σ {statistics.pstdev(vals):,.0f}")
+    return L
+
+
+def probe_nope_lines(raw) -> list:
+    rows = parse_nope(raw)
+    if not rows:
+        return ["解析不到行（结构见字段结构）"]
+    rth = [x for x in rows if is_rth(x["t"])]
+
+    def mono(k):
+        v = [x[k] for x in rth if x[k] is not None]
+        if len(v) < 10:
+            return "n/a"
+        return f"{100.0 * sum(1 for a, b in zip(v, v[1:]) if b >= a) / (len(v) - 1):.0f}%"
+
+    nf = [x["nf"] for x in rth if x["nf"] is not None]
+    nn = [x["nope"] for x in rth if x["nope"] is not None]
+    L = [f"{len(rows)} 行（常规时段 {len(rth)}）｜{hmd(rows[0]['t'])}→{hmd(rows[-1]['t'])} ET"]
+    L.append(f"nope_fill 首/末 {nf[0]:.4g}/{nf[-1]:.4g}｜nope 首/末 {nn[0]:.4g}/{nn[-1]:.4g}" if nf and nn else "nope / nope_fill 读不到数值")
+    L.append(f"逐行不下降的比例（≈100% = 当天累计值）：call_vol {mono('cv')}｜put_vol {mono('pv')}｜stock_vol {mono('sv')}｜call_delta {mono('cd')}")
+    return L
+
+
+def probe_levels_lines(a_key: str, b_key: str, a_name: str, b_name: str):
+    def f(raw) -> list:
+        lv = parse_price_levels(raw, a_key, b_key)
+        if not lv:
+            return ["解析不到价位行（结构见字段结构）"]
+        ta, tb = sum(x[1] for x in lv), sum(x[2] for x in lv)
+        prof = volume_profile(lv)
+        top = sorted(lv, key=lambda x: -(x[1] + x[2]))[:3]
+        L = [f"{len(lv)} 个价位 {lv[0][0]:g}–{lv[-1][0]:g}｜{a_name} {ta / 1e6:.1f}M｜{b_name} {tb / 1e6:.1f}M｜合计 {(ta + tb) / 1e6:.1f}M"]
+        if prof:
+            L.append(f"POC {prof['poc']:.2f}｜价值区 {prof['val']:.2f}–{prof['vah']:.2f}（分箱 ${prof['bin']:.2f}）｜量最大的 3 个价位："
+                     + "、".join(f"{p:g}({(a + b) / 1e6:.2f}M)" for p, a, b in top))
+        return L
+    return f
+
+
+def probe_strike_flow_lines(raw) -> list:
+    rows = _data_rows(raw)
+    if not rows:
+        return ["返回 0 行（结构见字段结构）"]
+    ts = [t for t in (_any_ts(r.get("timestamp")) for r in rows) if t]
+    ks = {num(r.get("strike")) for r in rows if num(r.get("strike")) is not None}
+    tot: dict = {}
+    for r in rows:
+        k = num(r.get("strike"))
+        if k is not None:
+            tot[k] = tot.get(k, 0.0) + (num(r.get("call_premium")) or 0.0) + (num(r.get("put_premium")) or 0.0)
+    top = sorted(tot.items(), key=lambda kv: -kv[1])[:5]
+    when = f"｜{hmd(min(ts))}→{hmd(max(ts))} ET" if ts else ""
+    L = [f"{len(rows)} 行｜{len(ks)} 个行权价{when}"]
+    if top:
+        L.append("权利金合计最大的 5 个行权价：" + "｜".join(f"{k:g} {money(v)}" for k, v in top))
+    return L
+
+
+def run_probe_streams(cfg: Cfg, uw, now, sleep=time.sleep) -> tuple:
+    """新数据流逐个检查：能不能调用、返回几行/什么字段/数据口径、最远能往回查多久。返回 (报告行, 字段结构行)。"""
+    sym = cfg.symbol
+    day = recent_trading_days(now, 1)[0]
+    today = now.astimezone(ET).date()
+    state = {"fm": ["date", "iso"]}
+
+    def gf0(x):
+        r = None
+        for fm in list(state["fm"]):
+            exp = x.isoformat() if fm == "date" else f"{x.isoformat()}T00:00:00.000Z"
+            r = uw.get(f"/api/stock/{sym}/greek-flow/{exp}", {"date": x.isoformat()}, retries=1)
+            if r.ok or r.status not in (400, 404, 422):
+                state["fm"] = [fm]
+                return r
+        return r
+
+    g = lambda path, extra=None: (lambda x: uw.get(path, {"date": x.isoformat(), **(extra or {})}, retries=1))  # noqa: E731
+    specs = [
+        ("0DTE 按行权价 gamma", lambda x: uw.get(f"/api/stock/{sym}/spot-exposures/expiry-strike",
+                                             {"expirations[]": x.isoformat(), "date": x.isoformat(), "limit": 500}, retries=1), probe_gamma_lines),
+        ("Greek flow（全部到期）", g(f"/api/stock/{sym}/greek-flow"), probe_gf_lines),
+        ("Greek flow（当天到期）", gf0, probe_gf_lines),
+        ("NOPE", g(f"/api/stock/{sym}/nope"), probe_nope_lines),
+        ("成交量价位·场内/场外", g(f"/api/stock/{sym}/stock-volume-price-levels"), probe_levels_lines("lit_vol", "off_vol", "场内(仅Nasdaq系)", "场外")),
+        ("成交量价位·暗池", g(f"/api/darkpool/{sym}/price-levels"), probe_levels_lines("dark_pool_volume", "regular_volume", "暗池", "常规")),
+        ("期权成交量按价位", g(f"/api/stock/{sym}/option/stock-price-levels"), probe_levels_lines("call_volume", "put_volume", "Call", "Put")),
+        ("按行权价盘中流向", g(f"/api/stock/{sym}/flow-per-strike-intraday", {"filter": "Volume"}), probe_strike_flow_lines),
+    ]
+    out, shapes, n_ok = [], [], 0
+    for name, call, summ in specs:
+        try:
+            r = call(day)
+            sleep(0.4)
+            log(f"probe(新数据流) {name}: HTTP {r.status} {r.ms}ms")
+            if not r.ok:
+                out.append(f"❌ {name}｜HTTP {r.status}｜{(r.err or '')[:120]}")
+                continue
+            n_ok += 1
+            lines = summ(r.data)
+            out.append(f"✅ {name}｜{lines[0]}")
+            out.extend(f"   {x}" for x in lines[1:])
+            out.append("   " + probe_depth(call, today, sleep=sleep))
+            shapes.append(f"▸ {name}\n   结构：{shape(r.data)[:500]}")
+        except Exception as e:  # noqa: BLE001
+            out.append(f"⚠ {name} 检查异常 {type(e).__name__}")
+    if state["fm"] != ["date", "iso"]:
+        out.append(f"   （按到期日的 Greek flow：到期日写法 {'YYYY-MM-DD' if state['fm'] == ['date'] else '完整 ISO 时间'} 可用）")
+    out.insert(0, f"🧪 新数据流检查（查询日期 {day}，即最近一个交易日）｜{n_ok}/{len(specs)} 项可用")
+    return out, shapes
 
 
 def run_probe(cfg: Cfg, uw: UW, tg: Telegram, now_fn=now_et) -> None:
@@ -2525,6 +2714,12 @@ def run_probe(cfg: Cfg, uw: UW, tg: Telegram, now_fn=now_et) -> None:
         lines_ok.extend(run_probe_extras(cfg, uw, probe_price, now_u, probe_levels))
     except Exception as e:  # noqa: BLE001
         lines_ok.append(f"⚠ 扩展接口检查异常 {type(e).__name__}")
+    try:
+        ok_l, shape_l = run_probe_streams(cfg, uw, now)
+        lines_ok.extend(ok_l)
+        lines_shape.extend(shape_l)
+    except Exception as e:  # noqa: BLE001
+        lines_ok.append(f"⚠ 新数据流检查异常 {type(e).__name__}")
     lim = getattr(uw, "limits", None) or {}
     lim_t = (f"额度头：limit={lim.get('limit')} count={lim.get('count')}" if lim
              else "额度头：无（符合 Basic 套餐“无每日请求上限”）")
@@ -2799,9 +2994,10 @@ def _po(x) -> str:
     return f"{x:+.0f}%" if abs(x) >= 10 else f"{x:+.1f}%"
 
 
-def build_backtest_report(cfg: Cfg, results: list, days: list, diag: list) -> list:
+def build_backtest_report(cfg: Cfg, results: list, days: list) -> list:
+    """附录A：提醒回测的完整统计（+5/+15/+30/+60 分钟、15:55、60 分钟内最好/最差）和逐条明细。要点见研究报告的"提醒入场"。"""
     HZ = (5, 15, 30, 60)
-    L = [f"📊 提醒回测 · {len(results)} 条提醒｜{days[0]}～{days[-1]}",
+    L = [f"📊 附录A｜提醒回测明细（{len(results)} 条提醒｜{days[0]}～{days[-1]}）",
          "入场：提醒之后的下一根 1 分钟线开盘价" + (f"，再延后 {cfg.bt_delay_min:g} 分钟" if cfg.bt_delay_min else "")
          + "；出场：入场后 +5/+15/+30/+60 分钟，或 15:55",
          f"现货：按提醒方向做多/做空 SPY｜期权：同方向、最接近平值的 0DTE（买 Call 或买 Put），买入和卖出各扣 ${cfg.bt_slip:.2f}/股滑点，未含手续费"]
@@ -2853,9 +3049,6 @@ def build_backtest_report(cfg: Cfg, results: list, days: list, diag: list) -> li
             L.append(f"{when} {tag} {r['lab']} 期权无数据（{(r.get('opt_err') or r.get('err') or '')[:70]}）｜{s_txt}")
     L.append("提示：「最好/最差」= 入场后60分钟内曾到过的最高/最低收益（不代表你一定能在那个价位成交）；1 张合约 = 100 股；"
              "期权用的是成交价而不是买卖报价，实际点差可能更大；样本很少，仅供参考。")
-    if diag:
-        L.append("【数据诊断】")
-        L.extend(f"  {x}" for x in diag)
     return L
 
 
@@ -2979,10 +3172,12 @@ def flow_matrix_lines(cfg: Cfg, rows: list, kind: str) -> list:
     return out
 
 
-def build_flow_study_report(cfg: Cfg, rows: list, days: list, n_items: int, diag: list) -> list:
-    L = [f"🔬 大单分类回测 · {days[0]}～{days[-1]}｜≥{money(cfg.print_min)} 的大单 {n_items} 条（可用 {len(rows)} 条）",
+def build_flow_study_report(cfg: Cfg, rows: list, days: list, n_items: int) -> list:
+    """附录B：大单分类回测的完整明细（按类别、分层、金额档 × 到期档矩阵、按天）。要点见研究报告的"大单买卖标签"。"""
+    L = [f"🔬 附录B｜大单分类回测明细（{days[0]}～{days[-1]}｜≥{money(cfg.print_min)} 的大单 {n_items} 条，可用 {len(rows)} 条）",
          "每条大单从生成后的下一分钟 SPY 开盘价算起，看之后 5/15/30/60 分钟 SPY 实际涨跌（%）。",
-         "「标签收益」= 按买卖标签的多空方向调整后的涨跌（买Call/卖Put 当多，买Put/卖Call 当空）；标签真有方向信息的话，它应明显大于 0、胜率应明显高于 50%。"]
+         "「标签收益」= 按买卖标签的多空方向调整后的涨跌（买Call/卖Put 当多，买Put/卖Call 当空）；注意它含大盘整体涨跌（见下面的基准），"
+         "要看方向有没有用，应看\"多空区分度\"（两组相减，抵消了大盘涨跌）。"]
     base = {H: _study_stats(rows, H)["mv"] for H in (5, 15, 30, 60)}
     L.append("基准（所有大单时点的 SPY 平均涨跌）：" + "｜".join(f"+{H}m {_pc(base[H])}" for H in (5, 15, 30, 60)))
 
@@ -3070,13 +3265,727 @@ def build_flow_study_report(cfg: Cfg, rows: list, days: list, n_items: int, diag
         if per:
             L.append(f"【{name} 60分钟标签收益·按天】" + "｜".join(per))
     L.append("提示：同一时段会连着出很多条大单，样本高度重叠，有效样本远小于条数；n 不到 30 的格子、只有几天的数据，只能当线索，不能当结论。")
-    if diag:
-        L.append("【数据诊断】")
-        L.extend(f"  {x}" for x in diag)
     return L
 
 
-def send_lines(tg, lines: list, limit: int = 3500) -> list:
+# ----------------------------------------------------------------------------
+# 研究报告（MODE=backtest）：结论先行 → 要点 → 附录
+# 新数据流检验：Greek flow / NOPE 与之后 SPY 涨跌的领先-滞后关系；前一日成交量价位（POC / 价值区）能不能挡住价格
+# 只做"信号有没有预测力"的检验，不改动面板和提醒的任何逻辑。
+# ----------------------------------------------------------------------------
+CHIP_OK, CHIP_FLAT, CHIP_THIN, CHIP_NA, CHIP_ERR = "🟢", "⚪", "🟡", "➖", "⚠"
+EDGE_MIN_PCT = 0.03          # "多空差"（SPY 涨跌，%）至少要有这么大，才可能盖过 0DTE 期权的点差 + 时间损耗
+MIN_STUDY_DAYS = 3           # 少于这么多天：一律"样本不足"
+MIN_SIDE_N = 100             # 多、空每一侧至少这么多条大单，才对大单标签下结论
+CONSISTENT = 0.8             # "按天一致"：至少 80% 的天与整体方向相同（且至少 4 天可比）
+SIG_STEP_MIN, SIG_WINDOW_MIN = 5, 15       # 信号检验：每 5 分钟取一个观察点，信号 = 近 15 分钟的流向
+BULL_CATS, BEAR_CATS = ("buy_call", "sell_put"), ("buy_put", "sell_call")
+SIG_NAMES = {"gf_all": "Greek flow·全部到期", "gf_0dte": "Greek flow·当天到期(0DTE)", "nope": "NOPE（成交口径）"}
+
+
+def sign_test_p(k: int, n: int) -> float:
+    """按天符号检验（双侧）：n 天里有 k 天为正，如果正负纯属随机（各 50%），出现这么一边倒（或更甚）的概率。"""
+    if n <= 0:
+        return 1.0
+    kk = max(k, n - k)
+    tail = sum(math.comb(n, i) for i in range(kk, n + 1)) / float(2 ** n)
+    return min(1.0, 2.0 * tail)
+
+
+def _ranks(xs: list) -> list:
+    idx = sorted(range(len(xs)), key=lambda i: xs[i])
+    out = [0.0] * len(xs)
+    i = 0
+    while i < len(idx):
+        j = i
+        while j + 1 < len(idx) and xs[idx[j + 1]] == xs[idx[i]]:
+            j += 1
+        r = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            out[idx[k]] = r
+        i = j + 1
+    return out
+
+
+def pearson(xs: list, ys: list):
+    n = len(xs)
+    if n < 3 or n != len(ys):
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    if sxx <= 0 or syy <= 0:
+        return None
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / math.sqrt(sxx * syy)
+
+
+def spearman(xs: list, ys: list, min_n: int = 20):
+    """秩相关（对极端值不敏感）。样本少于 min_n 返回 None。"""
+    if len(xs) < min_n or len(xs) != len(ys):
+        return None
+    return pearson(_ranks(xs), _ranks(ys))
+
+
+def lag1_autocorr(vals: list):
+    """相邻两个数的相关：接近 1 = 这列数是"累计值"；接近 0 = 每分钟的独立增量。"""
+    v = [x for x in vals if x is not None]
+    if len(v) < 30:
+        return None
+    return pearson(v[:-1], v[1:])
+
+
+def _cc(x) -> str:
+    return "—" if x is None else f"{x:+.2f}"
+
+
+# ---- 逐分钟数据（Greek flow / NOPE）→ 信号 ----
+def parse_nope(raw):
+    """/nope（逐分钟）→ [{t, nope, nf, cd, pd, cfd, pfd, cv, pv, sv}]，按时间升序；nf = nope_fill（用成交当时的 delta 算的 NOPE）。"""
+    out = []
+    for r in _data_rows(raw):
+        t = _any_ts(r.get("timestamp")) or _any_ts(r.get("time"))
+        if t is None:
+            continue
+        out.append({"t": t, "nope": num(r.get("nope")), "nf": num(r.get("nope_fill")),
+                    "cd": num(r.get("call_delta")), "pd": num(r.get("put_delta")),
+                    "cfd": num(r.get("call_fill_delta")), "pfd": num(r.get("put_fill_delta")),
+                    "cv": num(r.get("call_vol")), "pv": num(r.get("put_vol")), "sv": num(r.get("stock_vol"))})
+    out.sort(key=lambda x: x["t"])
+    return out or None
+
+
+class MinSeries:
+    """一天里的逐分钟数据。ts = 每行的分钟起点（epoch 秒）；cum=True 表示这列数是"当天累计值"（取窗口内的增量要做差）。"""
+
+    def __init__(self, rows: list, key: str, cum: bool = False):
+        pairs = sorted((r["t"].timestamp(), r[key]) for r in rows if r.get("t") is not None and r.get(key) is not None)
+        self.ts = [p[0] for p in pairs]
+        self.vals = [p[1] for p in pairs]
+        self.cum = cum
+
+    def window(self, t_end: float, minutes: float, max_stale_s: float = 180.0):
+        """t_end 之前（不含 t_end 这一分钟）最近 minutes 分钟的流量：增量序列 = 窗口内求和；累计序列 = 末值 − 窗口起点之前的值。
+        窗口里没有数据、或最后一行离 t_end 太久（数据没跟上）→ None。"""
+        i1 = bisect.bisect_left(self.ts, t_end)
+        i0 = bisect.bisect_left(self.ts, t_end - minutes * 60.0)
+        if i1 == 0 or t_end - self.ts[i1 - 1] > max_stale_s:
+            return None
+        if self.cum:
+            return None if i0 == 0 else self.vals[i1 - 1] - self.vals[i0 - 1]
+        return None if i1 <= i0 else sum(self.vals[i0:i1])
+
+
+def signal_points(day: date, ser, sig_fn, step_min: int = SIG_STEP_MIN, window_min: int = SIG_WINDOW_MIN,
+                  first_hm=(10, 0), last_hm=(15, 30), horizons=(5, 15, 30, 60)) -> list:
+    """某一天的观察点（每 step_min 分钟一个）：x = sig_fn(t)（只能用 t 之前已走完的分钟）；
+    f[H] = 从 t 起 H 分钟后 SPY 涨跌（%）；past = 之前 window_min 分钟的涨跌（%，用来看"流向是不是只在跟着价格走"）。"""
+    _o, close_t, _e = session_epochs(day)
+    t = datetime(day.year, day.month, day.day, first_hm[0], first_hm[1], tzinfo=ET).timestamp()
+    t_last = datetime(day.year, day.month, day.day, last_hm[0], last_hm[1], tzinfo=ET).timestamp()
+    pts = []
+    while t <= t_last:
+        x = sig_fn(t)
+        p0 = ser.price_at(t)
+        if x is not None and p0:
+            pp = ser.price_at(t - window_min * 60.0)
+            f = {}
+            for H in horizons:
+                p1 = ser.price_at(t + H * 60.0) if t + H * 60.0 <= close_t else None
+                f[H] = (p1 / p0 - 1.0) * 100.0 if p1 else None
+            pts.append({"day": day, "t": t, "x": x, "past": ((p0 / pp - 1.0) * 100.0) if pp else None, "f": f})
+        t += step_min * 60.0
+    return pts
+
+
+def tercile_spread(pts: list, H: int):
+    """信号最强的 1/3 减最弱的 1/3，之后 H 分钟 SPY 平均涨跌之差（%）；再按天算一遍（用整体的分界线），数有几天为正。"""
+    use = [p for p in pts if p["f"].get(H) is not None]
+    if len(use) < 30:
+        return None
+    xs = sorted(p["x"] for p in use)
+    lo_c, hi_c = xs[len(xs) // 3], xs[(2 * len(xs)) // 3]
+    if not hi_c > lo_c:
+        return None
+    hi = [p for p in use if p["x"] >= hi_c]
+    lo = [p for p in use if p["x"] <= lo_c]
+    if not hi or not lo:
+        return None
+
+    def mean(g):
+        return sum(p["f"][H] for p in g) / len(g)
+
+    pos = n = 0
+    for d in sorted({p["day"] for p in use}):
+        hd = [p for p in hi if p["day"] == d]
+        ld = [p for p in lo if p["day"] == d]
+        if len(hd) >= 4 and len(ld) >= 4:
+            n += 1
+            pos += 1 if mean(hd) - mean(ld) > 0 else 0
+    return {"spread": mean(hi) - mean(lo), "n_hi": len(hi), "n_lo": len(lo), "day_pos": pos, "day_n": n}
+
+
+def study_signal(pts: list, horizons=(5, 15, 30, 60), window_min: int = SIG_WINDOW_MIN) -> dict:
+    """一个信号的完整检验：与"之前"涨跌的相关（跟随）、与"之后 H 分钟"涨跌的相关（领先）、强弱三分之一的涨跌差、按天一致性。
+    noise = 相关系数的"噪声范围"（约 95%）：按"每天约 360/max(窗口,H) 个互不重叠的窗口"估算有效样本，样本重叠所以比点数少得多。"""
+    days = sorted({p["day"] for p in pts})
+    pp = [(p["x"], p["past"]) for p in pts if p.get("past") is not None]
+    res = {"n": len(pts), "days": len(days), "past": spearman([a for a, _ in pp], [b for _, b in pp]), "h": {}}
+    for H in horizons:
+        use = [p for p in pts if p["f"].get(H) is not None]
+        n_eff = max(1.0, len(days) * 360.0 / max(window_min, H))
+        res["h"][H] = {"n": len(use), "corr": spearman([p["x"] for p in use], [p["f"][H] for p in use]),
+                       "noise": 2.0 / math.sqrt(n_eff), "ts": tercile_spread(pts, H)}
+    return res
+
+
+def _consistent(pos: int, n: int, positive: bool) -> bool:
+    if n < 4:
+        return False
+    return pos >= CONSISTENT * n if positive else pos <= (1.0 - CONSISTENT) * n
+
+
+def signals_verdict(stats: dict) -> tuple:
+    """stats = {信号名: study_signal 结果} → (标记, 一句话)。有线索的门槛：相关系数超出噪声范围 + 强弱三分之一的涨跌差 ≥ EDGE_MIN_PCT + 按天一致。"""
+    if not stats:
+        return CHIP_ERR, "读不到数据（见附录诊断）"
+    days = max(s["days"] for s in stats.values())
+    if days < MIN_STUDY_DAYS or max(s["n"] for s in stats.values()) < 100:
+        return CHIP_THIN, f"只有 {days} 天的数据，样本不足，不下结论"
+    hits, follow = [], []
+    for name, s in stats.items():
+        for H in (15, 60):
+            h = s["h"].get(H)
+            ts = h["ts"] if h else None
+            if not h or h["corr"] is None or not ts:
+                continue
+            if abs(h["corr"]) >= h["noise"] and abs(ts["spread"]) >= EDGE_MIN_PCT and h["corr"] * ts["spread"] > 0 \
+                    and _consistent(ts["day_pos"], ts["day_n"], ts["spread"] > 0):
+                hits.append((abs(h["corr"]), name, H, h["corr"]))
+        if s["past"] is not None and abs(s["past"]) >= 0.2:
+            follow.append(name)
+    if hits:
+        _a, name, H, c = max(hits)
+        way = "（反向：流向偏多之后反而跌）" if c < 0 else ""
+        return CHIP_OK, (f"有线索：{len(hits)} 个检验过关，最强是 {SIG_NAMES.get(name, name)} 之后{H}分钟（相关 {_cc(c)}）{way}；"
+                         "6 个里挑出来的，有运气成分，需更多天确认")
+    tail = "；与之前涨跌明显相关，说明流向多半是在跟着价格走" if follow else ""
+    return CHIP_FLAT, "领先性都在噪声范围内，看不出它能提前告诉你方向" + tail
+
+
+def study_flow_signals(cfg: Cfg, uw, days: list, series_for, sleep, deadline: float, diag: list) -> dict:
+    """Greek flow（全部到期 / 当天到期）和 NOPE：每天取逐分钟数据，每 5 分钟一个观察点，
+    信号 = 近 15 分钟的方向性 delta 流（NOPE = 近 15 分钟的变化），对照之后 5/15/30/60 分钟 SPY 涨跌。"""
+    sym = cfg.symbol
+
+    def d_iso(d):
+        return {"date": d.isoformat()}
+
+    gf_all = fetch_stream_days(uw, "greek-flow", lambda d: uw.get(f"/api/stock/{sym}/greek-flow", d_iso(d), retries=1),
+                               parse_greek_flow, days, sleep, deadline, diag)
+    fmt = {"try": ["date", "iso"]}
+
+    def gf0_call(d):
+        r = None
+        for fm in list(fmt["try"]):
+            exp = d.isoformat() if fm == "date" else f"{d.isoformat()}T00:00:00.000Z"
+            r = uw.get(f"/api/stock/{sym}/greek-flow/{exp}", d_iso(d), retries=1)
+            if r.ok or r.status not in (400, 404, 422):
+                fmt["try"] = [fm]
+                return r
+        return r
+
+    gf_0 = fetch_stream_days(uw, "greek-flow(当天到期)", gf0_call, parse_greek_flow, days, sleep, deadline, diag)
+    nope = fetch_stream_days(uw, "nope", lambda d: uw.get(f"/api/stock/{sym}/nope", d_iso(d), retries=1),
+                             parse_nope, days, sleep, deadline, diag)
+    pts: dict = {"gf_all": [], "gf_0dte": [], "nope": []}
+    info: dict = {"gf_all": [], "gf_0dte": [], "nope": []}
+    for d in sorted(days):
+        ser = series_for(d)
+        if ser is None:
+            continue
+        for name, store, key in (("gf_all", gf_all, "dd"), ("gf_0dte", gf_0, "dd"), ("nope", nope, "nf")):
+            rows = [r for r in (store.get(d) or []) if et_day(r["t"].timestamp()) == d and is_rth(r["t"])]
+            if name == "nope" and rows and sum(1 for r in rows if r.get("nf") is not None) < len(rows) / 2:
+                key = "nope"                                         # nope_fill 大多缺失 → 退回 nope
+            if len(rows) < 200:
+                if store.get(d) is not None:
+                    diag.append(f"{SIG_NAMES[name]} {d:%m-%d}：常规时段只有 {len(rows)} 行，跳过")
+                continue
+            if name == "nope":
+                cum, ac = True, None                                  # NOPE 本身就是"当天累计"的水平值
+            else:
+                ac = lag1_autocorr([r[key] for r in rows])
+                cum = ac is not None and ac >= 0.9
+            ms = MinSeries(rows, key, cum)
+            pts[name].extend(signal_points(d, ser, lambda t, ms=ms: ms.window(t, SIG_WINDOW_MIN)))
+            info[name].append((d, cum, ac, len(rows)))
+    stats = {k: study_signal(v) for k, v in pts.items() if v}
+    return {"stats": stats, "info": info}
+
+
+# ---- 成交量价位 → POC / 价值区 ----
+def parse_price_levels(raw, a_key: str, b_key: str):
+    """成交量按价位的接口 → [(价位, a, b)]（升序）。a/b 的字段名：场内/场外 lit_vol/off_vol；暗池 dark_pool_volume/regular_volume；
+    期权 call_volume/put_volume。"""
+    out = []
+    for r in _data_rows(raw):
+        p = num(r.get("price"))
+        if p is None or p <= 0:
+            continue
+        out.append((p, num(r.get(a_key)) or 0.0, num(r.get(b_key)) or 0.0))
+    out.sort(key=lambda x: x[0])
+    return out or None
+
+
+def volume_profile(levels: list, bin_w=None, va_pct: float = 0.70):
+    """levels = [(价位, 量, …)]（价位之后的数全部加总）。按 bin_w 美元分箱 → POC（量最大的箱的中心）和价值区
+    （包住 va_pct 成交量的最小连续区间，标准的"两箱两箱"扩张法；VAH/VAL = 区间上沿/下沿）。无量返回 None。"""
+    pts = [(x[0], sum(x[1:])) for x in levels if sum(x[1:]) > 0]
+    if not pts:
+        return None
+    px = sorted(p for p, _ in pts)
+    med = px[len(px) // 2]
+    if bin_w is None:
+        bin_w = max(0.05, round(med * 0.00035 / 0.05) * 0.05)      # SPY≈730 → $0.25
+    bins: dict = {}
+    for p, v in pts:
+        k = int(math.floor(p / bin_w + 1e-9))
+        bins[k] = bins.get(k, 0.0) + v
+    k0, k1 = min(bins), max(bins)
+    vols = [bins.get(k, 0.0) for k in range(k0, k1 + 1)]
+    total = sum(vols)
+    centers = [(k0 + i + 0.5) * bin_w for i in range(len(vols))]
+    vwap = sum(c * v for c, v in zip(centers, vols)) / total
+    top = max(vols)
+    poc_i = min((i for i, v in enumerate(vols) if v == top), key=lambda i: abs(centers[i] - vwap))
+    lo = hi = poc_i
+    acc, n = vols[poc_i], len(vols)
+    while acc < va_pct * total and (lo > 0 or hi < n - 1):
+        up = (vols[hi + 1] + (vols[hi + 2] if hi + 2 < n else 0.0)) if hi + 1 < n else -1.0
+        dn = (vols[lo - 1] + (vols[lo - 2] if lo - 2 >= 0 else 0.0)) if lo - 1 >= 0 else -1.0
+        if up >= dn:
+            acc += up
+            hi = min(n - 1, hi + 2)
+        else:
+            acc += dn
+            lo = max(0, lo - 2)
+    return {"poc": centers[poc_i], "val": (k0 + lo) * bin_w, "vah": (k0 + hi + 1) * bin_w, "vwap": vwap,
+            "total": total, "bin": bin_w, "n": len(pts)}
+
+
+def touch_outcome(bars: list, level: float, tol_pct: float = 0.03, react_pct: float = 0.10, react_min: int = 20,
+                  t_from=None, t_to=None):
+    """价格第一次"碰到"level（进入 ±tol_pct 的带，且前一根收盘在带外，才知道是从哪边来的）之后 react_min 根分钟线内：
+    先朝来的方向反弹 react_pct → "bounce"；先穿到另一边 react_pct → "break"；都没有（或同一根里两边都到）→ "none"；没碰到 → None。"""
+    if not level or level <= 0:
+        return None
+    lo_z, hi_z = level * (1 - tol_pct / 100.0), level * (1 + tol_pct / 100.0)
+    up_t, dn_t = level * (1 + react_pct / 100.0), level * (1 - react_pct / 100.0)
+    prev_c = None
+    for i, b in enumerate(bars):
+        if t_from is not None and b["t"] < t_from:
+            prev_c = b["c"]
+            continue
+        if t_to is not None and b["t"] > t_to:
+            break
+        if b["l"] <= hi_z and b["h"] >= lo_z and prev_c is not None and (prev_c > hi_z or prev_c < lo_z):
+            side = 1 if prev_c > hi_z else -1                      # 1 = 从上方落下来（支撑测试），-1 = 从下方涨上来（压力测试）
+            for b2 in bars[i + 1:i + 1 + react_min]:
+                away = b2["h"] >= up_t if side > 0 else b2["l"] <= dn_t
+                through = b2["l"] <= dn_t if side > 0 else b2["h"] >= up_t
+                if away and through:
+                    return "none"
+                if away:
+                    return "bounce"
+                if through:
+                    return "break"
+            return "none"
+        prev_c = b["c"]
+    return None
+
+
+SHIFTS = (-1.0, -0.75, -0.5, -0.35, 0.35, 0.5, 0.75, 1.0)        # 对照组：把真实价位整体平移这么多 %
+
+
+def touch_study(day_levels: dict, bars_for, shifts=SHIFTS) -> dict:
+    """day_levels = {交易日: [前一日算出的价位…]}；bars_for(日) → 当天分钟线。
+    真实价位 vs 平移后的对照价位：价格第一次碰到之后，是"反弹"还是"穿过"。返回 {real/ctrl: {bounce, break, none, miss}}。"""
+    cnt = {"real": {"bounce": 0, "break": 0, "none": 0, "miss": 0}, "ctrl": {"bounce": 0, "break": 0, "none": 0, "miss": 0}}
+    for d in sorted(day_levels):
+        bars = bars_for(d)
+        if not bars:
+            continue
+        o_t, _c, _e = session_epochs(d)
+        t_from, t_to = o_t + 15 * 60, o_t + 360 * 60                # 09:45 – 15:30
+        for lv in day_levels[d]:
+            cases = [("real", lv)] + [("ctrl", lv * (1 + s / 100.0)) for s in shifts]
+            for kind, x in cases:
+                out = touch_outcome(bars, x, t_from=t_from, t_to=t_to)
+                cnt[kind]["miss" if out is None else out] += 1
+    return cnt
+
+
+def _bounce_rate(c: dict):
+    n = c["bounce"] + c["break"]
+    return (100.0 * c["bounce"] / n) if n else None
+
+
+def fetch_stream_days(uw, label: str, call_fn, parse_fn, days: list, sleep, deadline: float, diag: list) -> dict:
+    """逐日取一个"按日期"的接口，从最近的一天往回取，返回 {日: 解析后的行}。
+    遇到 401/402/403（多半是超出历史范围）就不再往更早取；连续 2 次其它错误也停，免得白白浪费请求。"""
+    out: dict = {}
+    bad = 0
+    for d in sorted(days, reverse=True):
+        if time.monotonic() > deadline:
+            diag.append(f"{label}：时间预算用完，只取到 {len(out)} 天")
+            break
+        r = call_fn(d)
+        sleep(0.4)
+        if not r.ok:
+            diag.append(f"{label} {d:%m-%d} HTTP {r.status} {(r.err or '')[:80]}".strip())
+            if r.status in (401, 402, 403):
+                break
+            bad += 1
+            if bad >= 2:
+                break
+            continue
+        bad = 0
+        rows = parse_fn(r.data)
+        if not rows:
+            diag.append(f"{label} {d:%m-%d} 返回 0 行（结构：{shape(r.data)[:100]}）")
+            continue
+        out[d] = rows
+    return out
+
+
+def _dedupe_levels(levels: list, tol_pct: float = 0.05) -> list:
+    out: list = []
+    for x in levels:
+        if x and all(abs(x - y) / y * 100.0 > tol_pct for y in out):
+            out.append(x)
+    return out
+
+
+def study_levels(cfg: Cfg, uw, days: list, series_for, sleep, deadline: float, diag: list) -> dict:
+    """前一日的成交量价位（POC / 价值区上下沿）能不能"挡住"今天的价格？
+    对照：前一日的最高/最低/收盘价；以及把真实价位平移后的"假价位"（同样的算法，用来排除"任何一条横线都有这个反弹率"）。"""
+    sym = cfg.symbol
+    d_iso = lambda d: {"date": d.isoformat()}                       # noqa: E731
+    srcs = (("暗池+常规", lambda d: uw.get(f"/api/darkpool/{sym}/price-levels", d_iso(d), retries=1),
+             lambda raw: parse_price_levels(raw, "dark_pool_volume", "regular_volume")),
+            ("场内+场外", lambda d: uw.get(f"/api/stock/{sym}/stock-volume-price-levels", d_iso(d), retries=1),
+             lambda raw: parse_price_levels(raw, "lit_vol", "off_vol")))
+    prof: dict = {}
+    for name, call, parse in srcs:
+        got = fetch_stream_days(uw, f"成交量价位·{name}", call, parse, days, sleep, deadline, diag)
+        prof[name] = {d: p for d, p in ((d, volume_profile(rows)) for d, rows in got.items()) if p}
+    prof = {k: v for k, v in prof.items() if v}
+    if not prof:
+        return {"err": "读不到成交量价位（见附录诊断）"}
+    primary = max(prof, key=lambda k: sum(p["total"] for p in prof[k].values()))      # 总成交量更大的那个口径更完整
+    pv = prof[primary]
+    va_levels, hlc_levels = {}, {}
+    ds = sorted(days)
+    for prev, d in zip(ds, ds[1:]):
+        if prev not in pv:
+            continue
+        p = pv[prev]
+        va_levels[d] = _dedupe_levels([p["poc"], p["vah"], p["val"]])
+        sp = series_for(prev)
+        if sp is not None and sp.bars:
+            hlc_levels[d] = _dedupe_levels([max(b["h"] for b in sp.bars), min(b["l"] for b in sp.bars), sp.bars[-1]["c"]])
+
+    def bars_for(d):
+        s = series_for(d)
+        return s.bars if s is not None else None
+
+    va = touch_study({d: v for d, v in va_levels.items() if bars_for(d)}, bars_for)
+    hlc = touch_study({d: v for d, v in hlc_levels.items() if bars_for(d)}, bars_for)
+    last_d = max(pv)
+    return {"primary": primary, "profiles": prof, "last": (last_d, pv[last_d]), "va": va, "hlc": hlc,
+            "n_days": len(va_levels)}
+
+
+def levels_verdict(res: dict) -> tuple:
+    if res.get("err"):
+        return CHIP_ERR, res["err"]
+    va = res["va"]
+    n_real = va["real"]["bounce"] + va["real"]["break"]
+    r_real, r_ctrl = _bounce_rate(va["real"]), _bounce_rate(va["ctrl"])
+    if res["n_days"] < MIN_STUDY_DAYS or n_real < 40 or r_ctrl is None:       # 少于 40 次有效触碰：差 15 个点也在误差范围内，不下结论
+        return CHIP_THIN, f"只测到 {n_real} 次有效触碰（{res['n_days']} 天），样本不足，只当参考"
+    gap = r_real - r_ctrl
+    if abs(gap) >= 15:
+        way = "" if gap > 0 else "（反过来：这些线更容易被穿过）"
+        return CHIP_OK, f"有线索：价格碰到前一日价值区的线后，反弹率 {r_real:.0f}% vs 对照 {r_ctrl:.0f}%{way}（需更多天确认）"
+    return CHIP_FLAT, f"反弹率 {r_real:.0f}% 与对照 {r_ctrl:.0f}% 差不多，没看出这些线比随便一条线更挡价"
+
+
+# ---- 各部分的"要点"与"附录"----
+def _sec(key: str, title: str) -> dict:
+    return {"key": key, "title": title, "chip": CHIP_NA, "head": "", "lines": [], "app": []}
+
+
+def section_alerts(cfg: Cfg, results: list, days: list, app_lines: list) -> dict:
+    sec = _sec("alerts", "提醒入场")
+    sec["app"] = app_lines
+    if not results:
+        sec["head"] = "没有可回测的提醒（journal 里还没有记录）"
+        return sec
+    n = len(results)
+    spot = [r["spot"] for r in results if r.get("spot")]
+    opt = [r["opt"] for r in results if r.get("opt")]
+    kinds = "｜".join(f"{KIND_ICON[k]}{KIND_NAME[k]}{sum(1 for r in results if r['a']['k'] == k)}"
+                      for k in ("conf", "single", "mega") if any(r["a"]["k"] == k for r in results))
+    span = f"{days[0]:%m-%d}" + (f"～{days[-1]:%m-%d}" if len(days) > 1 else " 一天")
+    sec["lines"].append(f"{n} 条提醒（{kinds}）｜{span}")
+    delay = f"（再延后 {cfg.bt_delay_min:g} 分钟）" if cfg.bt_delay_min else ""
+    sec["lines"].append(f"入场 = 提醒后下一分钟开盘价{delay}；现货 = 按提醒方向做多/做空 SPY；"
+                        f"期权 = 同方向最近平值 0DTE，买卖各扣 ${cfg.bt_slip:.2f}/股点差")
+
+    def seg(tracks, fmt):
+        out = []
+        for h in (15, 60):
+            k, w, m, md = _agg([t["ret"].get(h) for t in tracks])
+            out.append(f"+{h}m 赢{w}/{k} 均{fmt(m)} 中位{fmt(md)}" if k else f"+{h}m 无数据")
+        return "｜".join(out)
+
+    sec["lines"].append("现货 SPY：" + seg(spot, _pc))
+    sec["lines"].append("期权 0DTE：" + seg(opt, _po))
+    mf = [t["mfe"] for t in opt if t.get("mfe") is not None]
+    ma = [t["mae"] for t in opt if t.get("mae") is not None]
+    if mf and ma:
+        sec["lines"].append(f"入场后 60 分钟内（期权，均值）：最好 {_po(sum(mf) / len(mf))}｜最差 {_po(sum(ma) / len(ma))}")
+    by_kind = []
+    for k in ("conf", "single", "mega"):
+        sub = [r for r in results if r["a"]["k"] == k]
+        if sub:
+            sp = _agg([(r.get("spot") or {}).get("ret", {}).get(60) for r in sub])
+            op = _agg([(r.get("opt") or {}).get("ret", {}).get(60) for r in sub])
+            by_kind.append(f"{KIND_ICON[k]}{KIND_NAME[k]}{len(sub)}条 现货{_pc(sp[2])} 期权中位{_po(op[3])}")
+    if by_kind:
+        sec["lines"].append("按类型（+60m）：" + "｜".join(by_kind))
+    o60, s60 = _agg([t["ret"].get(60) for t in opt]), _agg([t["ret"].get(60) for t in spot])
+    skew = bool(o60[0]) and o60[2] is not None and o60[3] is not None and o60[2] > 0 > o60[3]
+    if len(days) < MIN_STUDY_DAYS or n < 30:
+        sec["chip"], sec["head"] = CHIP_THIN, f"只有 {len(days)} 天、{n} 条提醒，样本太少，下不了结论"
+    elif o60[0] and o60[3] is not None and o60[3] > 0 and o60[1] / o60[0] >= 0.55 and s60[2] is not None and s60[2] > 0:
+        sec["chip"], sec["head"] = CHIP_OK, f"有线索：期权 +60m 中位 {_po(o60[3])}、{o60[1]}/{o60[0]} 赢，现货均 {_pc(s60[2])}（需更多天确认）"
+    else:
+        sec["chip"], sec["head"] = CHIP_FLAT, f"期权 +60m 中位 {_po(o60[3])}、现货均 {_pc(s60[2])}，看不出优势"
+    if skew:
+        sec["head"] += "；期权的平均数被少数大赢家拉高（中位数为负）"
+    return sec
+
+
+def flow_edge(rows: list, bull: tuple, bear: tuple, H: int) -> dict:
+    """偏多标签之后的 SPY 平均涨跌 − 偏空标签之后的（%）。两组同时受大盘涨跌影响，相减后基本抵消。"""
+    def mean(cats):
+        v = [r["r"].get(H) for r in rows if r["cat"] in cats and r["r"].get(H) is not None]
+        return (sum(v) / len(v), len(v)) if v else (None, 0)
+
+    a, na = mean(bull)
+    b, nb = mean(bear)
+    return {"edge": (a - b) if a is not None and b is not None else None, "na": na, "nb": nb}
+
+
+def flow_edge_by_day(rows: list, bull: tuple, bear: tuple, H: int, min_side: int = 5):
+    pos = n = 0
+    for d in sorted({r["day"] for r in rows}):
+        e = flow_edge([r for r in rows if r["day"] == d], bull, bear, H)
+        if e["edge"] is not None and e["na"] >= min_side and e["nb"] >= min_side:
+            n += 1
+            pos += 1 if e["edge"] > 0 else 0
+    return pos, n
+
+
+def section_flow(cfg: Cfg, rows: list, days: list, n_items: int, app_lines: list) -> dict:
+    sec = _sec("flow", "大单买卖标签")
+    sec["app"] = app_lines
+    if not rows:
+        sec["chip"], sec["head"] = CHIP_THIN, "没有取到足够的大单样本（见附录诊断）"
+        return sec
+    sec["lines"].append(f"≥{money(cfg.print_min)} 的大单 {n_items} 条（可用 {len(rows)} 条）｜{len(days)} 天")
+    sec["lines"].append("问：偏多标签（买Call/卖Put）之后，SPY 是不是比偏空标签（买Put/卖Call）之后涨得多？看\"多空差\"：")
+    pos, nd = flow_edge_by_day(rows, BULL_CATS, BEAR_CATS, 15)
+    groups = (("全部标签", BULL_CATS, BEAR_CATS), ("买入型 买Call−买Put", ("buy_call",), ("buy_put",)),
+              ("卖出型 卖Put−卖Call", ("sell_put",), ("sell_call",)))
+    res = {}
+    for name, bull, bear in groups:
+        e15, e60 = flow_edge(rows, bull, bear, 15), flow_edge(rows, bull, bear, 60)
+        res[name] = (e15, e60)
+        extra = f"｜按天 {pos}/{nd} 为正" if name == "全部标签" and nd else ""
+        sec["lines"].append(f" {name}：15m {_pc(e15['edge'])}｜60m {_pc(e60['edge'])}（n {e15['na']}／{e15['nb']}）{extra}")
+    dte_parts = []
+    for label, bks in (("0DTE", ("0DTE",)), ("1–5天", ("1–5天",)), ("6天以上", ("6–30天", "30天+"))):
+        sub = [r for r in rows if dte_bucket(r["dte"]) in bks]
+        e = flow_edge(sub, BULL_CATS, BEAR_CATS, 15)
+        ok = e["edge"] is not None and min(e["na"], e["nb"]) >= 30
+        dte_parts.append(f"{label} {_pc(e['edge']) if ok else '样本少'}（n {e['na']}／{e['nb']}）")
+    sec["lines"].append(" 按到期（全部标签 15m）：" + "｜".join(dte_parts))
+    tot = len(rows)
+    share = {b: sum(1 for r in rows if dte_bucket(r["dte"]) in bks) for b, bks in
+             (("0DTE", ("0DTE",)), ("1–5天", ("1–5天",)), ("6天以上", ("6–30天", "30天+")))}
+    zero_p = sum(r["prem"] or 0 for r in rows if dte_bucket(r["dte"]) == "0DTE")
+    all_p = sum(r["prem"] or 0 for r in rows)
+    zp = 100.0 * zero_p / all_p if all_p else 0.0
+    note = "——你做的是 0DTE，这些大单大多是更远期的，参考价值有限" if 100.0 * share["0DTE"] / tot < 30 else ""
+    sec["lines"].append(" 到期分布（按条数）：" + "｜".join(f"{b} {100.0 * n / tot:.0f}%" for b, n in share.items())
+                        + f"｜0DTE 按金额 {zp:.0f}%{note}")
+    e15, e60 = res["全部标签"]
+    nmin = min(e15["na"], e15["nb"])
+    if len(days) < MIN_STUDY_DAYS or nmin < MIN_SIDE_N or e15["edge"] is None:
+        sec["chip"], sec["head"] = CHIP_THIN, f"样本不足（{len(days)} 天，偏多/偏空各 {e15['na']}／{e15['nb']} 条）"
+    else:
+        x15, x60 = e15["edge"], e60["edge"]
+        cons = _consistent(pos, nd, x15 > 0)
+        if abs(x15) >= EDGE_MIN_PCT and x60 is not None and x15 * x60 > 0 and cons:
+            way = "有线索" if x15 > 0 else "标签方向反着走（偏多之后反而涨得少）"
+            sec["chip"], sec["head"] = CHIP_OK, f"{way}：多空差 15m {_pc(x15)}｜60m {_pc(x60)}，按天 {pos}/{nd} 一致（需更多天确认）"
+        else:
+            if abs(x15) < EDGE_MIN_PCT:
+                why = f"幅度不到 {EDGE_MIN_PCT:.2f}%，盖不住期权点差——买卖标签没有可用的方向信息"
+            elif x60 is None or x15 * x60 <= 0:
+                why = "15m 与 60m 方向不一致，不下结论"
+            else:
+                why = f"按天只有 {pos}/{nd} 一致，不稳定，不下结论"
+            sec["chip"], sec["head"] = CHIP_FLAT, f"多空差 15m {_pc(x15)}｜60m {_pc(x60)}，{why}"
+    return sec
+
+
+def section_signals(res: dict) -> dict:
+    sec = _sec("signals", "Greek flow / NOPE")
+    stats, info = res.get("stats") or {}, res.get("info") or {}
+    chip, head = signals_verdict(stats)
+    sec["chip"], sec["head"] = chip, head
+    if not stats:
+        return sec
+    nd = max(s["days"] for s in stats.values())
+    npt = max(s["n"] for s in stats.values())
+    sec["lines"].append(f"{nd} 天｜每 {SIG_STEP_MIN} 分钟看一次（共 {npt} 个观察点）｜信号 = 近 {SIG_WINDOW_MIN} 分钟的方向性 delta 流"
+                        "（NOPE = 近 15 分钟的变化）")
+    sec["lines"].append("问：信号强的时候，之后的 SPY 是不是真的涨/跌得更多？（相关 > 0 = 流向偏多之后涨；"
+                        "强1/3−弱1/3 = 信号最强的三分之一时点之后的平均涨跌，减信号最弱的三分之一）")
+    for name in ("gf_all", "gf_0dte", "nope"):
+        s = stats.get(name)
+        if not s:
+            sec["lines"].append(f" {SIG_NAMES[name]}：没有数据")
+            continue
+        h15, h60 = s["h"][15], s["h"][60]
+        ts = h15["ts"]
+        tail = f"｜强1/3−弱1/3 15m {_pc(ts['spread'])}（按天 {ts['day_pos']}/{ts['day_n']} 为正）" if ts else ""
+        sec["lines"].append(f" {SIG_NAMES[name]}：之后15m 相关 {_cc(h15['corr'])}｜之后60m {_cc(h60['corr'])}{tail}")
+    sec["lines"].append(" 对照——与\"之前 15 分钟\"涨跌的相关："
+                        + "｜".join(f"{SIG_NAMES[k]} {_cc(stats[k]['past'])}" for k in ("gf_all", "gf_0dte", "nope") if k in stats))
+    noise = max(h["noise"] for s in stats.values() for h in s["h"].values())
+    sec["lines"].append(f" 噪声范围：相关系数在 ±{noise:.2f} 以内，可能只是运气（样本重叠，有效样本远少于点数）")
+    # 附录：全部周期 + 数据口径判定
+    app = ["🌊 附录C｜Greek flow / NOPE 全部结果（相关 = 秩相关；强1/3−弱1/3 = 信号最强的三分之一减最弱的三分之一，之后 SPY 平均涨跌之差）"]
+    for name in ("gf_all", "gf_0dte", "nope"):
+        s = stats.get(name)
+        if not s:
+            continue
+        app.append(f"  {SIG_NAMES[name]}｜{s['days']} 天 {s['n']} 点｜与之前15m涨跌相关 {_cc(s['past'])}")
+        for H in (5, 15, 30, 60):
+            h = s["h"][H]
+            ts = h["ts"]
+            tail = f"｜强1/3−弱1/3 {_pc(ts['spread'])}（n {ts['n_hi']}／{ts['n_lo']}｜按天 {ts['day_pos']}/{ts['day_n']}）" if ts else "｜强弱差 —"
+            app.append(f"    之后{H}m：相关 {_cc(h['corr'])}（噪声±{h['noise']:.2f}｜n={h['n']}）{tail}")
+    for name in ("gf_all", "gf_0dte", "nope"):
+        rows = info.get(name) or []
+        if rows:
+            n_cum = sum(1 for _d, c, _a, _n in rows if c)
+            acs = [a for _d, _c, a, _n in rows if a is not None]
+            how = "当天累计值（已做差）" if n_cum * 2 > len(rows) else "逐分钟增量（已求和）"
+            ac_t = f"｜lag1 自相关 {sum(acs) / len(acs):.2f}" if acs else ""
+            app.append(f"  口径判定·{SIG_NAMES[name]}：{how}{ac_t}｜{len(rows)} 天")
+    sec["app"] = app
+    return sec
+
+
+def section_levels(res: dict) -> dict:
+    sec = _sec("levels", "前一日价值区（POC）")
+    chip, head = levels_verdict(res)
+    sec["chip"], sec["head"] = chip, head
+    if res.get("err"):
+        return sec
+    d, p = res["last"]
+    sec["lines"].append(f"最新一日 {d:%m-%d}（{res['primary']}口径）：POC {p['poc']:.2f}｜价值区 {p['val']:.2f}–{p['vah']:.2f}｜成交量加权均价 {p['vwap']:.2f}")
+    others = [f"{k} POC {v[d]['poc']:.2f}" for k, v in res["profiles"].items() if k != res["primary"] and d in v]
+    if others:
+        sec["lines"].append("  对照其它口径：" + "｜".join(others))
+
+    def row(name, c):
+        r = _bounce_rate(c)
+        return f"{name}：反弹 {c['bounce']}｜穿过 {c['break']}｜无反应 {c['none']}（反弹率 {f'{r:.0f}%' if r is not None else '—'}）"
+
+    sec["lines"].append(f"挡价测试（{res['n_days']} 天）：价格第一次碰到某条线后 20 分钟内，先反弹 0.10% 还是先穿过 0.10%")
+    sec["lines"].append(" " + row("前一日 POC＋价值区上下沿", res["va"]["real"]))
+    sec["lines"].append(" " + row("对照：把这三条线平移后的假价位", res["va"]["ctrl"]))
+    sec["lines"].append(" " + row("参考：前一日 最高/最低/收盘", res["hlc"]["real"]))
+    miss = f"  没碰到价位的次数：真实价位 {res['va']['real']['miss']}｜对照 {res['va']['ctrl']['miss']}｜前一日高低收 {res['hlc']['real']['miss']}"
+    sec["app"] = ["📦 附录D｜成交量价位口径与明细", miss] + [
+        f"  {k}：{len(v)} 天｜最新 {max(v):%m-%d} POC {v[max(v)]['poc']:.2f} 价值区 {v[max(v)]['val']:.2f}–{v[max(v)]['vah']:.2f}｜分箱 ${v[max(v)]['bin']:.2f}"
+        f"｜总量 {v[max(v)]['total'] / 1e6:.1f}M"
+        for k, v in res["profiles"].items()] + [
+        "  规则：POC = 成交量最大的价位箱；价值区 = 包住 70% 成交量的最小连续区间；碰到 = 价格进入线 ±0.03% 且前一根收盘在带外；",
+        "  对照价位 = 真实价位整体平移 ±0.35/0.5/0.75/1.0%，用同样的方法测，用来排除\"任何横线都有这个反弹率\"。"]
+    return sec
+
+
+def section_gamma() -> dict:
+    sec = _sec("gamma", "0DTE 按行权价 gamma")
+    sec["head"] = "历史接口只给当天最后一个快照，回测会带入未来信息，本次不测"
+    sec["lines"] = ["按文档，查历史日期只返回该日\"最近的一个快照\"（收盘附近）；拿它去\"预测\"盘中价格，等于偷看答案。",
+                    "办法：让监控从现在起每 5 分钟记一次 0DTE 快照，攒 2–3 周后再测\"哪些行权价真的挡得住价格\"。接口的实际返回样子，可以用 probe 模式看。"]
+    return sec
+
+
+def build_research_report(cfg: Cfg, secs: list, span: tuple, ndays: int, diag: list) -> tuple:
+    """→ (结论页, 要点页, 附录) 三组行。结论页必须能在一条消息里发完。"""
+    L1 = [f"📌 SPY 研究报告｜{span[0]:%Y-%m-%d}～{span[1]:%m-%d}（{ndays} 个交易日）", "【先看结论】"]
+    for s in secs:
+        L1.append(f"{s['chip']} {s['title']}：{s['head']}")
+    cnt = {c: sum(1 for s in secs if s["chip"] == c) for c in (CHIP_OK, CHIP_FLAT, CHIP_THIN, CHIP_NA, CHIP_ERR)}
+    if cnt[CHIP_OK]:
+        L1.append(f"→ 有 {cnt[CHIP_OK]} 项出现线索（🟢），但都还要更多天确认；其余没有证据。")
+    elif cnt[CHIP_FLAT]:
+        L1.append("→ 样本够的部分（⚪）都没看出优势；其余样本不够或没读到数据，暂时没有结论。")
+    else:
+        L1.append("→ 这次样本不够或没读到数据，暂时没有结论：既不能说有用，也不能说没用。")
+    L1 += ["【怎么读】",
+           "🟢 有线索（仍需更多天确认）｜⚪ 样本够、但看不出优势｜🟡 样本不够，不下结论｜➖ 本次没测｜⚠ 读不到数据",
+           f"「多空差」= 偏多标签之后 SPY 的平均涨跌 − 偏空标签之后的（基本不受当天趋势影响）；±{EDGE_MIN_PCT:.2f}% 以内，盖不住 0DTE 期权的点差和时间损耗。",
+           "【下一步】"]
+    steps = []
+    if ndays < 10:
+        steps.append("想要更可靠的结论：仓库 Settings → Secrets and variables → Actions → Variables 里新建 BT_FLOW_DAYS = 20，再运行一次 backtest（样本约放大 4 倍）。")
+    if any(s["key"] == "gamma" and s["chip"] == CHIP_NA for s in secs):
+        steps.append("0DTE 按行权价 gamma 需要先积累快照：可以让监控从明天起自动记录（要改一次代码；不影响现有提醒）。")
+    steps.append("本报告只检验\"信号有没有预测力\"，面板和提醒的逻辑一律没改。")
+    L1.extend(f"• {x}" for x in steps)
+
+    L2 = []
+    for s in secs:
+        if not s["lines"]:
+            continue
+        L2.append(f"{s['chip']} {s['title']}")
+        L2.extend(s["lines"])
+        L2.append("")
+    if L2 and L2[-1] == "":
+        L2.pop()
+
+    L3 = ["📎 附录（需要细看时再翻；以上结论不依赖这些）"]
+    for s in secs:
+        if s["app"]:
+            L3.extend(s["app"])
+    if diag:
+        L3.append("【数据诊断】")
+        L3.extend(f"  {x}" for x in diag)
+    return L1, L2, (L3 if len(L3) > 1 else [])
+
+
+def send_lines(tg, lines: list, limit: int = 3500, silent: bool = False) -> list:
     msgs, cur = [], ""
     for ln in lines:
         if cur and len(cur) + len(ln) + 1 > limit:
@@ -3086,7 +3995,7 @@ def send_lines(tg, lines: list, limit: int = 3500) -> list:
     if cur:
         msgs.append(cur)
     for m in msgs:
-        if tg.send(m, silent=False) is None:
+        if tg.send(m, silent=silent) is None:
             log("Telegram 发送失败：", tg.last_error)
     return msgs
 
@@ -3105,48 +4014,118 @@ def recent_trading_days(now: datetime, n: int) -> list:
 
 
 def run_backtest(cfg: Cfg, uw, tg, sleep=time.sleep, state_path: str = STATE_FILE, now_fn=now_et) -> None:
+    """研究报告：① 提醒入场回测 ② 大单买卖标签 ③ Greek flow / NOPE ④ 前一日价值区 ⑤ 0DTE 行权价 gamma（只说明为什么不测）。
+    每一部分单独 try，一部分出错不影响其它；最后依次发：结论页 → 要点页 → 附录。"""
     now = now_fn()
     series_cache: dict = {}
-    spy_diag: dict = {}
+    spy_raw: dict = {}
 
     def series_for(day):
         if day not in series_cache:
             bars, dg = fetch_spy_bars(uw, cfg, day, sleep)
             series_cache[day] = BarSeries(bars) if len(bars) >= 100 else None
-            spy_diag[day] = f"{day:%m-%d} SPY 1分钟线：" + "｜".join(dg)
+            spy_raw[day] = dg
         return series_cache[day]
 
-    # ① 提醒回测：journal + 内置样本
-    alerts = collect_alerts(cfg, state_path)
-    if alerts:
-        results, days = run_alert_backtest(cfg, uw, alerts, series_for, sleep)
-        diag = [spy_diag[d] for d in days if d in spy_diag]
-        diag += [r["opt_err"] for r in results if r.get("opt_err") and "无法入场" not in r["opt_err"]][:6]
-        send_lines(tg, build_backtest_report(cfg, results, days, diag))
-    else:
-        tg.send("ℹ️ 提醒回测｜没有可回测的提醒（journal 里还没有记录，且内置样本已关闭）", silent=False)
+    def spy_diag_lines(days_used) -> list:
+        normal, out = [], []
+        for d in days_used:
+            dg = spy_raw.get(d)
+            if dg is None:
+                continue
+            m = re.search(r"(\d+)根$", dg[0]) if len(dg) == 1 else None
+            if m and int(m.group(1)) >= 380:
+                normal.append(d)
+            else:
+                out.append(f"{d:%m-%d} SPY 1分钟线：" + "｜".join(dg))
+        if normal:
+            out.insert(0, f"SPY 1分钟线：{len(normal)} 天正常（{'、'.join(f'{d:%m-%d}' for d in normal[:3])}{'…' if len(normal) > 3 else ''}）")
+        return out
 
-    # ② 大单分类回测：最近几个交易日的 UW flow-alerts × SPY 分钟线
+    def err_sec(key, title, e):
+        s = _sec(key, title)
+        s["chip"], s["head"] = CHIP_ERR, f"这一部分出错：{type(e).__name__}（其它部分不受影响）"
+        return s
+
+    tg.send("⏳ 研究报告开始生成（约 3–8 分钟）。完成后依次发：结论 → 要点 → 附录。", silent=True)
+    secs: list = []
+    diag: list = []
+    alert_days: list = []
+
+    # ① 提醒回测：journal + 内置样本
+    try:
+        alerts = collect_alerts(cfg, state_path)
+        if alerts:
+            results, alert_days = run_alert_backtest(cfg, uw, alerts, series_for, sleep)
+            diag += spy_diag_lines(alert_days)
+            diag += [r["opt_err"] for r in results if r.get("opt_err") and "无法入场" not in r["opt_err"]][:6]
+            secs.append(section_alerts(cfg, results, alert_days, build_backtest_report(cfg, results, alert_days)))
+        else:
+            s = _sec("alerts", "提醒入场")
+            s["head"] = "没有可回测的提醒（journal 里还没有记录，且内置样本已关闭）"
+            secs.append(s)
+    except Exception as e:  # noqa: BLE001
+        log("提醒回测出错：", type(e).__name__, e)
+        secs.append(err_sec("alerts", "提醒入场", e))
+
+    fdays: list = []
     if cfg.bt_flow_days > 0:
+        all_days = recent_trading_days(now, cfg.bt_flow_days + 1)       # 多取最早一天：只用来算"前一日"的价值区
+        fdays = all_days[1:]
+        # ② 大单买卖标签：最近几个交易日的 UW flow-alerts × SPY 分钟线
         try:
-            fdays = recent_trading_days(now, cfg.bt_flow_days)
             t_start = datetime(fdays[0].year, fdays[0].month, fdays[0].day, 9, 25, tzinfo=ET).timestamp()
             t_end = min(datetime(fdays[-1].year, fdays[-1].month, fdays[-1].day, 16, 20, tzinfo=ET).timestamp(), now.timestamp())
             items, fdiag = fetch_flow_history(uw, cfg, t_start, t_end, sleep)
+            diag.append("flow-alerts：" + "｜".join(x.replace("flow-alerts ", "") for x in fdiag))
             if not items:
-                tg.send("ℹ️ 大单分类回测｜没有取到大单记录\n" + "\n".join(fdiag), silent=False)
-                return
-            rows = flow_study_rows(items, series_for)
-            if len(rows) < 20:
-                tg.send(f"ℹ️ 大单分类回测｜取到 {len(items)} 条大单，但能配上 SPY 分钟线的只有 {len(rows)} 条，样本不足\n"
-                        + "\n".join(fdiag + [v for v in spy_diag.values()]), silent=False)
-                return
-            sdays = sorted({r["day"] for r in rows})
-            send_lines(tg, build_flow_study_report(cfg, rows, sdays, len(items),
-                                                   fdiag + [spy_diag[d] for d in sdays if d in spy_diag]))
+                s = _sec("flow", "大单买卖标签")
+                s["chip"], s["head"] = CHIP_ERR, "没有取到大单记录（见附录诊断）"
+                secs.append(s)
+            else:
+                rows = flow_study_rows(items, series_for)
+                sdays = sorted({r["day"] for r in rows})
+                diag += spy_diag_lines(sdays)
+                if len(rows) < 20:
+                    s = _sec("flow", "大单买卖标签")
+                    s["chip"], s["head"] = CHIP_THIN, f"取到 {len(items)} 条大单，但能配上 SPY 分钟线的只有 {len(rows)} 条，样本不足"
+                    secs.append(s)
+                else:
+                    secs.append(section_flow(cfg, rows, sdays, len(items), build_flow_study_report(cfg, rows, sdays, len(items))))
         except Exception as e:  # noqa: BLE001
             log("大单分类回测出错：", type(e).__name__, e)
-            tg.send(f"⚠ 大单分类回测出错：{type(e).__name__}（提醒回测结果已发送，不受影响）", silent=False)
+            secs.append(err_sec("flow", "大单买卖标签", e))
+
+        # ③④⑤ 新数据流：Greek flow / NOPE、前一日价值区、0DTE 行权价 gamma
+        deadline = time.monotonic() + cfg.bt_stream_s
+        sdiag: list = []
+        try:
+            secs.append(section_signals(study_flow_signals(cfg, uw, fdays, series_for, sleep, deadline, sdiag)))
+        except Exception as e:  # noqa: BLE001
+            log("Greek flow / NOPE 检验出错：", type(e).__name__, e)
+            secs.append(err_sec("signals", "Greek flow / NOPE", e))
+        try:
+            secs.append(section_levels(study_levels(cfg, uw, all_days, series_for, sleep, deadline, sdiag)))
+        except Exception as e:  # noqa: BLE001
+            log("成交量价位检验出错：", type(e).__name__, e)
+            secs.append(err_sec("levels", "前一日价值区（POC）", e))
+        secs.append(section_gamma())
+        diag += sdiag
+        diag += [x for x in spy_diag_lines(all_days) if x not in diag]
+
+    ok_days = [d for d in fdays if series_cache.get(d) is not None] or fdays or alert_days or [now.astimezone(ET).date()]
+    ok_days = sorted(ok_days)
+    try:
+        L1, L2, L3 = build_research_report(cfg, secs, (ok_days[0], ok_days[-1]), len(ok_days), diag)
+    except Exception as e:  # noqa: BLE001
+        log("研究报告排版出错：", type(e).__name__, e)
+        tg.send(f"⚠ 研究报告排版出错：{type(e).__name__}（各部分已算完，但没能整理成报告；详情见 Actions 日志）", silent=False)
+        raise
+    send_lines(tg, L1)                       # 只有结论页响铃；要点页和附录静音，免得连响三次
+    if L2:
+        send_lines(tg, L2, silent=True)
+    if L3:
+        send_lines(tg, L3, silent=True)
 
 
 def main() -> None:
