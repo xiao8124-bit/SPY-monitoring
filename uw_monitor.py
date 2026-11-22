@@ -40,6 +40,7 @@ SPY 期权结构 + 资金流 实时监控（Unusual Whales API）→ Telegram
 from __future__ import annotations
 
 import bisect
+import html as _html
 import json
 import math
 import os
@@ -48,6 +49,7 @@ import statistics
 import sys
 import time
 import traceback
+import unicodedata
 from datetime import date, datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -62,7 +64,8 @@ STATE_FILE = os.environ.get("STATE_FILE", "uw_state.json")
 DISCLAIMER = "⚠ 描述性提示，非交易建议"
 SRC_LABEL = {"oi": "OI口径", "vol": "成交口径"}
 CAP_LABEL = {"quote": "实时价格", "state": "备用价格", "lv_primary": "点位(OI)", "lv_live": "点位(盘中)", "ticks": "净权利金",
-             "flow": "大单提醒", "greek": "日度Gamma", "strikes": "按行权价墙位", "ticks_prev": "前一日资金流基线"}
+             "flow": "大单提醒", "greek": "日度Gamma", "strikes": "按行权价墙位", "ticks_prev": "前一日资金流基线",
+             "x0": "0DTE当日买卖汇总"}
 
 # ----------------------------------------------------------------------------
 # 脱敏与日志
@@ -206,6 +209,31 @@ class Cfg:
         self.bt_flow_days = int(f("BT_FLOW_DAYS", 5))  # "大单分类回测"回看最近几个交易日；0 = 不做
         self.bt_deep = f("BT_DEEP_DELTA", 0.6)        # |delta| ≥ 此值视为"深实值"
         self.bt_stream_s = f("BT_STREAM_SECONDS", 540)  # 新数据流检验（Greek flow / NOPE / 价值区）的时间预算（秒）；用完就只用已取到的天数
+
+        # ---- 2026-11 提醒改版（v2）：每一项都有开关，在 Variables 里设为 0 就回到旧行为 ----
+        self.fmt_v2 = b("FMT_V2", True)                       # 新版面：五点位梯子 + 结构/资金/动量三块 + 等宽对齐（Telegram HTML）
+        self.invalid_v2 = b("INVALID_V2", True)               # 新判定："转弱 → 失效"两级，取代"自极值回撤 0.25%"
+        self.fastmove = b("FASTMOVE", True)                   # 快速异动提醒（10 分钟内涨跌 ≥ 门槛）
+        self.loud_tiers = b("LOUD_TIERS", True)               # 按重要性分级响铃 + 同位置合并，取代"前 6 条响铃"
+        self.whale_0dte_only = b("WHALE_0DTE_ONLY", True)     # 巨额单 / 大单偏向只看 0DTE（远期合约不推）
+        self.flow_v2 = b("FLOW_V2", True)                     # 资金块：0DTE 全量买卖权利金（flow-per-expiry）+ 0DTE 大单；读不到时退回过渡口径
+        self.weak_buf_pct = f("WEAK_BUFFER_PCT", 0.20)        # 价格收回突破位多少（%）才算"转弱"
+        self.weak_hold_s = f("WEAK_HOLD_SECONDS", 180)        # …并站稳多久
+        self.invalid_hold_min = f("INVALID_HOLD_MIN", 10)     # 收复突破位持续这么久（分钟）→ 失效
+        self.swing_min_pct = f("SWING_MIN_PCT", 0.10)         # 反向摆动至少这么大（%）才算"一次反弹/回落"
+        self.swing_confirm_s = f("SWING_CONFIRM_SECONDS", 60) # 越过最近一次反弹高点/回落低点后站稳多久 → 失效
+        self.fm_window_min = f("FASTMOVE_MINUTES", 10)
+        self.fm_floor = f("FASTMOVE_MIN_USD", 2.0)            # 快速异动的最小幅度（美元）
+        self.fm_mult = f("FASTMOVE_SIGMA_MULT", 2.5)          # 且需超过近期波动的这么多倍（随行情自适应）
+        self.fm_cap = int(f("FASTMOVE_CAP", 30))              # 快速异动每日带提示音上限（只是防刷屏的保险）
+        self.type_cap = int(f("LOUD_TYPE_CAP", 10))           # 其它每类提醒的每日带提示音上限（同上）
+        self.merge_min = f("SAME_LEVEL_MERGE_MIN", 30)        # 同一位置这么多分钟内再次突破 → 静音，只标"第 N 次"
+        self.far_pct = f("FAR_PCT", 1.5)                      # 离现价超过这么多（%）的点位标"远"
+        self.old_min = f("OLD_EVENT_MIN", 60)                 # 事件超过这么多分钟标"旧"（只显示，不影响判断）
+        self.whale_min = f("WHALE_0DTE_MIN", 500000)          # 0DTE 巨额单门槛（美元）
+        self.print_burst0 = f("PRINT_BURST_0DTE", 1500000)    # 0DTE 大单"同向合计"门槛（美元）
+        self.print_count0 = int(f("PRINT_COUNT_0DTE", 2))     # …且至少这么多笔
+        self.x0_every = f("X0_EVERY_SECONDS", 60)
 
 
 # ----------------------------------------------------------------------------
@@ -351,6 +379,74 @@ def fmt_age(seconds) -> str:
     return f"{s / 86400:.1f}天"
 
 
+# ---- 新版面（v2）用的小工具：Telegram HTML 文本、显示宽度、时间/比例格式 ----
+class HTMLText(str):
+    """带 Telegram HTML 标记的消息文本。是 str 的子类，所以能沿用现有的 outbox / 推送流程；纯文字版用 strip_html 取得。"""
+
+
+_TAG_RE = re.compile(r"<[^>]*>")
+LOUD_TIER_KINDS = ("conf", "conf_run", "single", "mega", "fastmove", "invalid")
+
+
+def esc(x) -> str:
+    return _html.escape(str(x), quote=False)
+
+
+def strip_html(t) -> str:
+    return _html.unescape(_TAG_RE.sub("", str(t)))
+
+
+def dwidth(s) -> int:
+    """显示宽度：中日韩/全角字符按 2 格，其余 1 格（等宽字体里对齐用）。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in str(s))
+
+
+def padw(s, w: int, right: bool = False) -> str:
+    s = str(s)
+    gap = max(0, w - dwidth(s))
+    return (" " * gap + s) if right else (s + " " * gap)
+
+
+def age_short(seconds) -> str:
+    """事件年龄：45秒 / 31分钟 / 2时47分。"""
+    if seconds is None:
+        return "n/a"
+    sec = max(0, int(seconds))
+    if sec < 90:
+        return f"{sec}秒"
+    m = sec // 60
+    if m < 90:
+        return f"{m}分钟"
+    return f"{m // 60}时{m % 60:02d}分"
+
+
+def ratio_text(c, p) -> str:
+    """CALL : PUT 比例（较小的一边记 1）。两边都要为正才有意义。"""
+    if c is None or p is None or c <= 0 or p <= 0:
+        return "—"
+    if abs(c - p) / max(c, p) < 0.05:
+        return "1 : 1"
+    return f"{c / p:.1f} : 1" if c > p else f"1 : {p / c:.1f}"
+
+
+def add_footer(text, footer: str):
+    return HTMLText(f"{text}\n{esc(footer)}") if isinstance(text, HTMLText) else f"{text}\n{footer}"
+
+
+def render_segs(segs, html: bool = True) -> str:
+    """版面片段 → 文本。("b", 文字)=加粗标题；("t", 文字)=普通行；("pre", [行…])=等宽块（数字对齐用）。HTML 模式下所有文字都做转义。"""
+    out = []
+    for kind, val in segs:
+        if kind == "pre":
+            body = "\n".join(val)
+            out.append(f"<pre>{esc(body)}</pre>" if html else body)
+        elif kind == "b":
+            out.append(f"<b>{esc(val)}</b>" if html else str(val))
+        else:
+            out.append(esc(val) if html else str(val))
+    return "\n".join(out)
+
+
 # ----------------------------------------------------------------------------
 # HTTP 客户端：UW / Telegram
 # ----------------------------------------------------------------------------
@@ -460,24 +556,40 @@ class Telegram:
             return False, None, err
         return False, None, err
 
-    def send(self, text: str, silent: bool = False):
-        ok, res, err = self._call(
-            "sendMessage",
-            {"chat_id": self.chat, "text": clip(text), "disable_notification": bool(silent),
-             "disable_web_page_preview": True},
-        )
+    def send(self, text: str, silent: bool = False, html: bool = False):
+        html = bool(html or isinstance(text, HTMLText))
+        if html and len(text) > 3900:                    # 截断会切断 HTML 标记、整条被拒：超长时直接用纯文字版
+            text, html = strip_html(text), False
+        payload = {"chat_id": self.chat, "text": str(text) if html else clip(str(text)),
+                   "disable_notification": bool(silent), "disable_web_page_preview": True}
+        if html:
+            payload["parse_mode"] = "HTML"
+        ok, res, err = self._call("sendMessage", payload)
+        if not ok and html and (err or "").startswith("400"):     # 排版被拒收（极少见）：退回纯文字再发一次，不丢提醒
+            log("HTML 排版被拒收，改发纯文字：", err)
+            payload.pop("parse_mode", None)
+            payload["text"] = clip(strip_html(text))
+            ok, res, err = self._call("sendMessage", payload)
         if ok and isinstance(res, dict):
             self.last_error = None
             return res.get("message_id")
         self.last_error = err
         return None
 
-    def edit(self, message_id, text: str) -> str:
-        ok, _res, err = self._call(
-            "editMessageText",
-            {"chat_id": self.chat, "message_id": message_id, "text": clip(text),
-             "disable_web_page_preview": True},
-        )
+    def edit(self, message_id, text: str, html: bool = False) -> str:
+        html = bool(html or isinstance(text, HTMLText))
+        if html and len(text) > 3900:
+            text, html = strip_html(text), False
+        payload = {"chat_id": self.chat, "message_id": message_id, "text": str(text) if html else clip(str(text)),
+                   "disable_web_page_preview": True}
+        if html:
+            payload["parse_mode"] = "HTML"
+        ok, _res, err = self._call("editMessageText", payload)
+        if not ok and html and "parse" in (err or "").lower():    # 排版被拒收：退回纯文字
+            log("HTML 排版被拒收，改发纯文字：", err)
+            payload.pop("parse_mode", None)
+            payload["text"] = clip(strip_html(text))
+            ok, _res, err = self._call("editMessageText", payload)
         if ok:
             return "ok"
         el = (err or "").lower()
@@ -678,6 +790,43 @@ def parse_flow(raw, today: date):
     return out
 
 
+def parse_flow_expiry(raw, today: date):
+    """flow-per-expiry：每个到期日"最近交易日"的 call/put 权利金（ask 侧=买方主动成交，bid 侧=卖方主动成交）。取"当天到期（0DTE）"那一行。
+    返回 {"ok": 数据日期就是今天, "date", "expiry", "ca"(买Call), "cb"(卖Call), "pa"(买Put), "pb"(卖Put), "cv", "pv"}；没有当天到期的行返回 None。"""
+    top_date = str(raw.get("date") or "")[:10] if isinstance(raw, dict) else ""
+    d = unwrap(raw)
+    if isinstance(d, dict):
+        d = d.get("data", [])
+    if not isinstance(d, list):
+        return None
+    for r in d:
+        if not isinstance(r, dict):
+            continue
+        exp = str(r.get("expiry") or "")[:10]
+        if exp != today.isoformat():
+            continue
+        row_date = str(r.get("date") or "")[:10] or top_date
+
+        def g(*keys):
+            for k in keys:
+                v = num(r.get(k))
+                if v is not None:
+                    return v
+            return None
+
+        ca = g("call_premium_ask_side", "call_ask_side_premium", "call_premium_ask")
+        pa = g("put_premium_ask_side", "put_ask_side_premium", "put_premium_ask")
+        if ca is None and pa is None:
+            return None
+        # 数据日期不是今天（或读不出日期）就不当作"今天的汇总"：宁可退回过渡口径，也不把昨天的数字当成今天的
+        return {"ok": bool(row_date) and row_date == today.isoformat(), "date": row_date or None, "expiry": exp,
+                "ca": ca or 0.0, "pa": pa or 0.0,
+                "cb": g("call_premium_bid_side", "call_bid_side_premium", "call_premium_bid") or 0.0,
+                "pb": g("put_premium_bid_side", "put_bid_side_premium", "put_premium_bid") or 0.0,
+                "cv": g("call_premium") or 0.0, "pv": g("put_premium") or 0.0}
+    return None
+
+
 def parse_greek(raw):
     d = unwrap(raw)
     if isinstance(d, dict):
@@ -812,6 +961,7 @@ def tide_stats(ticks, now_u: datetime, window_min: float, sigma_prev, cfg: Cfg):
     if sigma and sigma > 0 and recent:
         z = S / (sigma * math.sqrt(len(recent)))
     return {"S": S, "z": z, "n": len(recent), "sigma": sigma,
+            "ncp_win": sum(t["ncp"] for t in ticks if t["t"] > cut), "npp_win": sum(t["npp"] for t in ticks if t["t"] > cut),
             "ncp_day": sum(t["ncp"] for t in ticks), "npp_day": sum(t["npp"] for t in ticks),
             "last": ticks[-1]["t"] if ticks else None, "n_all": len(ticks)}
 
@@ -890,8 +1040,8 @@ def save_state(path: str, st: dict) -> None:
 # ----------------------------------------------------------------------------
 # 提醒复盘（收盘摘要用）：每条提醒按"提醒价"入场的现货收益
 # ----------------------------------------------------------------------------
-KIND_ICON = {"conf": "🔔", "conf_run": "🔁", "single": "⚡", "mega": "🐋"}
-KIND_NAME = {"conf": "共振", "conf_run": "共振延续", "single": "结构", "mega": "巨额单"}
+KIND_ICON = {"conf": "🔔", "conf_run": "🔁", "single": "⚡", "mega": "🐋", "fastmove": "💨", "invalid": "↩", "weak": "↩"}
+KIND_NAME = {"conf": "共振", "conf_run": "共振延续", "single": "结构", "mega": "巨额单", "fastmove": "快速异动", "invalid": "失效", "weak": "转弱"}
 
 
 def alert_scorecard(alerts, day_px, horizons=(15, 30, 60)):
@@ -1009,18 +1159,34 @@ class Engine:
         return e
 
     def queue_push(self, now, kind, text, silent=False, P=None, d=None, brief=None):
-        s = self.s
-        if kind in ("conf", "single", "mega", "conf_run") and not silent:
-            key, cap, what = (("loud_run", self.cfg.run_cap, "延续/升级提醒") if kind == "conf_run"
-                              else ("loud_capped", self.cfg.daily_cap, "信号"))
+        s, cfg = self.s, self.cfg
+        if cfg.loud_tiers:
+            # 分级响铃（v2）：重要类型默认响铃（共振 / 快速异动 / 首次破位 / 0DTE 买方巨额单 / 失效），其余静音；
+            # 每一类各有当日上限（只是防刷屏的保险），超出后自动转静音。是否静音由调用方按重要性决定。
+            if kind in LOUD_TIER_KINDS and not silent:
+                cap = cfg.fm_cap if kind == "fastmove" else cfg.type_cap
+                key = f"loud_{kind}"
+                if s["counters"].get(key, 0) >= cap:
+                    silent = True
+                    text = add_footer(text, f"（今日「{KIND_NAME.get(kind, kind)}」已推送 {cap} 条带提示音，之后改为静音提示）")
+                else:
+                    s["counters"][key] = s["counters"].get(key, 0) + 1
+        elif kind in ("conf", "single", "mega", "conf_run") and not silent:
+            key, cap, what = (("loud_run", cfg.run_cap, "延续/升级提醒") if kind == "conf_run"
+                              else ("loud_capped", cfg.daily_cap, "信号"))
             if s["counters"].get(key, 0) >= cap:                         # 防刷屏：超过当日上限自动转静音
                 silent = True
                 text += f"\n（今日已推送 {cap} 条带提示音的{what}，之后改为静音提示）"
             else:
                 s["counters"][key] = s["counters"].get(key, 0) + 1
-        s["outbox"].append({"t": iso(now), "kind": kind, "text": text, "silent": bool(silent), "attempts": 0})
+        item = {"t": iso(now), "kind": kind, "text": str(text), "silent": bool(silent), "attempts": 0}
+        if isinstance(text, HTMLText):
+            item["html"] = True                                          # 重新加载状态后仍按 HTML 发送
+        s["outbox"].append(item)
         s["counters"]["silent" if silent else "pushed"] += 1
-        if P is not None and kind in ("conf", "single", "mega", "conf_run"):
+        if kind in ("conf", "conf_run", "single", "mega", "fastmove", "weak", "invalid"):
+            s["counters"]["k_" + kind] = s["counters"].get("k_" + kind, 0) + 1      # 收盘摘要里按类型统计
+        if P is not None and kind in ("conf", "single", "mega", "conf_run", "fastmove"):
             try:
                 self.journal_add(now, kind, d, P, bool(silent), brief or text)
             except Exception:  # noqa: BLE001  记录失败绝不能影响推送
@@ -1028,7 +1194,8 @@ class Engine:
 
     def journal_add(self, now, kind, d, P, silent, text):
         """记录一条提醒（时间/类型/方向/提醒价/是否静音/摘要），跨日保留 120 天、最多 600 条；回测与收盘复盘都读它。"""
-        first = (text or "").strip().splitlines()[0] if (text or "").strip() else ""
+        text = strip_html(text) if isinstance(text, HTMLText) else (text or "")
+        first = text.strip().splitlines()[0] if text.strip() else ""
         j = self.s.setdefault("journal", [])
         j.append({"t": iso(now), "k": kind, "d": d, "p": round(float(P), 2), "s": bool(silent), "x": first[:80]})
         cut = now - timedelta(days=120)
@@ -1106,7 +1273,12 @@ class Engine:
                     f"在区外持续 {held:.0f}秒；{drv}）")
             if chop:
                 text += f"\n  ⚠ {cfg.chop_window_min:.0f}分钟内第{len(fc)}次穿越，Flip 附近来回震荡，可靠性较低（不计入结构确认）"
-            self.add_event(now, "flip_cross", d, text, P, chop=chop)
+            extra = {}
+            if cfg.loud_tiers:                                   # 同一位置第几次、距上次多久（分级响铃 / 同位置合并用）
+                # 分方向计数：向下穿越之后的"向上收复"是反向的新信息，不算同一位置的重复
+                n_hit, prev_ago = self.level_hit(now, f"Flip区{'向上' if d == 'up' else '向下'}", zone["center"])
+                extra = {"n": n_hit, "prev_ago": prev_ago, "held": int(held), "level": zone["center"]}
+            self.add_event(now, "flip_cross", d, text, P, chop=chop, **extra)
             if not chop:
                 self.register_break(now, d, zone["high"] if d == "up" else zone["low"], "Flip区")
 
@@ -1142,13 +1314,17 @@ class Engine:
                         tol = max(2 * buf, lvl * 0.0015)
                         same = [x for x in allh if abs(x[1] - lvl) <= tol]
                         chop = len(same) >= cfg.chop_crosses
-                        self.s["broken"][kind] = {"level": lvl, "t": iso(now), "chop": chop}
+                        extra = {}
+                        if cfg.loud_tiers:                       # 同一位置第几次、距上次多久（分级响铃 / 同位置合并用）
+                            n_hit, prev_ago = self.level_hit(now, name, lvl)
+                            extra = {"n": n_hit, "prev_ago": prev_ago, "held": int(held)}
+                        self.s["broken"][kind] = {"level": lvl, "t": iso(now), "chop": chop, "n": extra.get("n")}
                         text = (f"{name} {lvl:.2f} {'向上突破' if d == 'up' else '向下跌破'}已确认"
                                 f"（现价 {P:.2f}，已越过 {abs(P - lvl):.2f}，持续 {held:.0f}秒）")
                         if chop:
                             text += (f"\n  ⚠ {cfg.chop_window_min:.0f}分钟内第{len(same)}次突破同一墙位，价格在墙位附近来回震荡，"
                                      f"可靠性较低（不计入结构确认）")
-                        self.add_event(now, "wall_break", d, text, P, level=lvl, chop=chop)
+                        self.add_event(now, "wall_break", d, text, P, level=lvl, chop=chop, **extra)
                         if not chop:
                             self.register_break(now, d, lvl, name)
             br = self.s["broken"].get(kind)
@@ -1158,6 +1334,19 @@ class Engine:
                     self.s["broken"][kind] = None
             if lv.get(kind) is not None:
                 ws[f"{kind}_ref"] = lv[kind]
+
+    def level_hit(self, now, name, lvl):
+        """记录"价格确认穿越/突破了某个点位"：返回 (今天第几次突破这个位置, 距上一次多少分钟 或 None)。
+        同一个位置 = 名称相同且价格相差不超过 max(0.5 美元, 0.15%)。"""
+        hits = self.s.setdefault("lvl_hits", [])
+        ts = now.timestamp()
+        tol = max(0.5, lvl * 0.0015)
+        same = [h for h in hits if h["name"] == name and abs(h["lvl"] - lvl) <= tol]
+        n = len(same) + 1
+        prev_ago = (ts - same[-1]["ts"]) / 60.0 if same else None
+        hits.append({"name": name, "lvl": round(lvl, 2), "ts": ts})
+        self.s["lvl_hits"] = hits[-60:]
+        return n, prev_ago
 
     # ---------- 动量 A：破位后延伸（没有反转回突破位就一直追，不设时间上限） ----------
     def register_break(self, now, d, level, label):
@@ -1206,6 +1395,51 @@ class Engine:
                 s["impulse_state"] = d
         elif (st == "up" and up < thr * 0.5) or (st == "down" and dn > -thr * 0.5):
             s["impulse_state"] = None
+
+    # ---------- 动量 C：快速异动（v2）：N 分钟内单向走出 ≥ 门槛（美元），门槛随近期波动自适应；同方向继续走就继续提醒 ----------
+    def fm_threshold(self, P) -> float:
+        cfg = self.cfg
+        thr = cfg.fm_floor
+        sg = self.view.get("sigma1m")
+        if sg:
+            thr = max(thr, cfg.fm_mult * (sg / 100.0) * P * math.sqrt(cfg.fm_window_min))
+        return thr
+
+    def update_fastmove(self, now, P):
+        """10 分钟内（价格样本约 15 秒一个）自窗口低点上涨 / 自高点下跌 ≥ max($2, 2.5×近期每分钟波动×√10)，触发"快速异动"。
+        同方向：此后价格每再多走一个门槛（相对上一次提醒价），就再提醒一次（第 N 次，附"自首次累计"）；30 分钟没有新的提醒则视为这一波结束。
+        反方向触发 = 新的一波（第 1 次）。不设同方向冷却——趋势走得越远越要提醒。"""
+        cfg, s = self.cfg, self.s
+        ts = now.timestamp()
+        win = [p for (t, p) in s["px_hist"] if t >= ts - cfg.fm_window_min * 60]
+        self.view["fm"] = None
+        if len(win) < 4:
+            return
+        thr = self.fm_threshold(P)
+        lo, hi = min(win), max(win)
+        up, dn = P - lo, P - hi                              # up >= 0, dn <= 0
+        fm = s.get("fm")
+        if fm and self.age_min(fm["last_t"], now) > 30:
+            fm = s["fm"] = None
+        self.view["fm"] = {"up": up, "dn": dn, "thr": thr, "run": fm}
+        d = "up" if (up >= thr and up >= -dn) else ("down" if dn <= -thr else None)
+        if not d:
+            return
+        sgn = 1 if d == "up" else -1
+        if fm and fm["dir"] == d:
+            if (P - fm["last_px"]) * sgn < thr:               # 还没比上一次提醒多走一个门槛
+                return
+            fm["n"] += 1
+        else:
+            fm = s["fm"] = {"dir": d, "n": 1, "first_t": iso(now), "first_px": lo if d == "up" else hi}
+        fm["last_px"], fm["last_t"], fm["thr"] = P, iso(now), thr
+        mv = up if d == "up" else dn
+        ref = lo if d == "up" else hi
+        cum = P - fm["first_px"]
+        text = (f"快速{'拉升' if d == 'up' else '下杀'} {mv:+.2f}（{cfg.fm_window_min:.0f}分钟内 {ref:.2f}→{P:.2f}，阈值 ±{thr:.2f}）"
+                + (f"｜第{fm['n']}次，自 {hm(parse_iso(fm['first_t']))} 首次累计 {cum:+.2f}" if fm["n"] >= 2 else ""))
+        self.add_event(now, "fastmove", d, text, P, n=fm["n"], first_t=fm["first_t"], first_px=round(fm["first_px"], 2),
+                       cum=round(cum, 2), move=round(mv, 2), ref=round(ref, 2), thr=round(thr, 2))
 
     # ---------- 里程碑：参考点每走出 ±MOMENTUM_PCT% 记一次（仅面板 / 可选的单独推送） ----------
     def update_momentum(self, now, P):
@@ -1284,36 +1518,53 @@ class Engine:
             if it["key"] in f["seen"]:
                 continue
             f["seen"].append(it["key"])
-            f["items"].append({k: it[k] for k in ("t", "sign", "side", "prem", "type", "strike", "dte", "rule", "iv", "delta")})
+            f["items"].append({k: it.get(k) for k in ("t", "sign", "side", "prem", "type", "strike", "dte", "rule", "iv", "delta", "multileg")})
             if it["prem"] >= cfg.print_min:                      # 全天累计：买/卖 × Call/Put（面板与收盘摘要用）
                 mix_add(f.setdefault("day_mix", {}), it.get("type"), it.get("side"), it["prem"])
+                if cfg.flow_v2 and self.clean0(it):              # 0DTE 大单当日累计（UW 汇总读不到时的过渡口径）+ 最近几笔
+                    mix_add(f.setdefault("day0", {}), it.get("type"), it.get("side"), it["prem"])
+                    l0 = f.setdefault("last0", [])
+                    l0.append({"t": it["t"], "side": it.get("side"), "type": it.get("type"), "strike": it.get("strike"),
+                               "prem": it["prem"], "sign": it["sign"]})
+                    f["last0"] = l0[-6:]
             fresh = (now_u - it["tdt"]).total_seconds() <= 600
-            if fresh and it["prem"] >= cfg.mega_min:
+            if cfg.whale_0dte_only:
+                if fresh and self.is_whale(it):                  # 只看当天到期（0DTE）的巨额单；远期合约不推
+                    d = {1: "up", -1: "down"}.get(it["sign"])
+                    self.add_event(now, "mega", d, self.describe_print_v2(it), P, prem=it["prem"], side=it.get("side"),
+                                   typ=it.get("type"), strike=it.get("strike"), dte=it.get("dte"), delta=it.get("delta"),
+                                   iv=it.get("iv"), tt=it["t"], rule=it.get("rule"))
+            elif fresh and it["prem"] >= cfg.mega_min:
                 d = {1: "up", -1: "down"}.get(it["sign"])
                 self.add_event(now, "mega", d, self.describe_print(it, now), P, prem=it["prem"])
         f["seen"] = f["seen"][-400:]
         f["items"] = [x for x in f["items"] if self.age_min(x["t"], now) <= 90][-300:]
 
-        # 大单窗口合计
+        # 大单窗口合计（v2：只算 0DTE、非多腿、非深实值的大单，同向合计门槛更低但至少 2 笔）
         win = [x for x in f["items"] if self.age_min(x["t"], now) <= cfg.print_window_min and x["prem"] >= cfg.print_min]
+        if cfg.flow_v2:
+            win = [x for x in win if self.clean0(x)]
+            burst, min_cnt = cfg.print_burst0, cfg.print_count0
+        else:
+            burst, min_cnt = cfg.print_burst, cfg.print_min_count
         up = sum(x["prem"] for x in win if x["sign"] > 0)
         dn = sum(x["prem"] for x in win if x["sign"] < 0)
         n_up = sum(1 for x in win if x["sign"] > 0)
         n_dn = sum(1 for x in win if x["sign"] < 0)
         cur = None
-        if up >= cfg.print_burst and n_up >= cfg.print_min_count and up >= cfg.print_dominance * dn:
+        if up >= burst and n_up >= min_cnt and up >= cfg.print_dominance * dn:
             cur = "up"
-        elif dn >= cfg.print_burst and n_dn >= cfg.print_min_count and dn >= cfg.print_dominance * up:
+        elif dn >= burst and n_dn >= min_cnt and dn >= cfg.print_dominance * up:
             cur = "down"
         if cur:
             if cur != f["prints_state"]:
                 tot, cnt = (up, n_up) if cur == "up" else (dn, n_dn)
                 mixt = mix_text(print_mix(win), MIX_BULL if cur == "up" else MIX_BEAR)
                 self.add_event(now, "prints", cur,
-                               f"大单偏{'多' if cur == 'up' else '空'}：近{cfg.print_window_min:.0f}分钟同向合计 {money(tot)}（{cnt}笔）"
+                               f"{'0DTE ' if cfg.flow_v2 else ''}大单偏{'多' if cur == 'up' else '空'}：近{cfg.print_window_min:.0f}分钟同向合计 {money(tot)}（{cnt}笔）"
                                + (f"｜{mixt}" if mixt else ""), P, prem=tot)
             f["prints_state"] = cur
-        elif max(up, dn) < 0.5 * cfg.print_burst:
+        elif max(up, dn) < 0.5 * burst:
             f["prints_state"] = None
         self.view["prints"] = {"up": up, "dn": dn, "n_up": n_up, "n_dn": n_dn, "mix": print_mix(win)}
 
@@ -1340,6 +1591,23 @@ class Engine:
                 elif abs(z) < cfg.tide_z * 0.6:
                     f["tide_state"] = None
 
+    # ---- 0DTE 大单的判定（v2）----
+    def clean0(self, it) -> bool:
+        """计入"0DTE 大单"汇总的大单：当天到期、不是多腿组合单、不是深实值（|Δ| 小于 BT_DEEP_DELTA，默认 0.6）。"""
+        dl = it.get("delta")
+        return it.get("dte") == 0 and not it.get("multileg") and not (dl is not None and abs(dl) >= self.cfg.bt_deep)
+
+    def is_whale(self, it) -> bool:
+        """0DTE 巨额单：当天到期、单笔 ≥ WHALE_0DTE_MIN、不是多腿组合单（多腿里的一条腿不代表整体方向）。"""
+        return it.get("dte") == 0 and not it.get("multileg") and it["prem"] >= self.cfg.whale_min
+
+    def describe_print_v2(self, it) -> str:
+        side = {"ask": "BUY", "bid": "SELL"}.get(it.get("side"), "MIX")
+        strike = f"{it['strike']:g}" if it.get("strike") is not None else "?"
+        how = {"ask": "主动买入(ask侧)", "bid": "主动卖出(bid侧)"}.get(it.get("side"), "买卖混合")
+        bias = {1: "偏多", -1: "偏空", 0: "方向不明"}[it.get("sign", 0)]
+        return f"0DTE {side} {(it.get('type') or '?').upper()} {strike} {money(it['prem'])}｜{how}→{bias}"
+
     def describe_print(self, it, now) -> str:
         dte = it.get("dte")
         dte_s = "0DTE" if dte == 0 else (f"{dte}DTE" if dte is not None else "")
@@ -1357,7 +1625,9 @@ class Engine:
                 f"（{it.get('rule') or ''}）{g}").replace("  ", " ")
 
     # ---------- 结构证据 / 三大类状态 ----------
-    def struct_evidence(self, now) -> dict:
+    def struct_rows(self, now) -> dict:
+        """结构证据（含确认时间、第几次，供 v2 版面显示持续时间）：{"up": [row…], "down": [row…]}，
+        row = {"tag", "text"（旧版文字）, "name"（短名）, "t"（确认时间 ISO）, "n"（同一位置第几次）}。判定逻辑与旧版完全一致。"""
         cfg, s = self.cfg, self.s
         out = {"up": [], "down": []}
         zs = s["zone"]
@@ -1371,7 +1641,9 @@ class Engine:
                                and ((P > zone["center"]) == (d == "up")))
                     ok_side = far
                 if ok_side:
-                    out[d].append(("flip_cross", f"Flip区{'向上' if d == 'up' else '向下'}穿越（{hm(parse_iso(e['t']))}确认）"))
+                    out[d].append({"tag": "flip_cross", "t": e["t"], "n": e.get("n"),
+                                   "name": f"Flip区{'向上' if d == 'up' else '向下'}穿越",
+                                   "text": f"Flip区{'向上' if d == 'up' else '向下'}穿越（{hm(parse_iso(e['t']))}确认）"})
                 break
         for kind, d in (("call", "up"), ("put", "down")):
             br = s["broken"].get(kind)
@@ -1381,15 +1653,22 @@ class Engine:
                     P = self.view.get("P")
                     ok = bool(P and ((P - br["level"]) if d == "up" else (br["level"] - P)) / P * 100 >= cfg.chop_clear_pct)
                 if ok:
-                    out[d].append(("wall_break", f"{'Call' if kind == 'call' else 'Put'} Wall {br['level']:.2f} "
-                                                 f"{'上破' if d == 'up' else '下破'}（{hm(parse_iso(br['t']))}确认，尚未收复）"))
+                    nm = f"{'Call' if kind == 'call' else 'Put'} Wall {br['level']:.2f} {'上破' if d == 'up' else '下破'}"
+                    out[d].append({"tag": "wall_break", "t": br["t"], "n": br.get("n"), "name": nm,
+                                   "text": f"{nm}（{hm(parse_iso(br['t']))}确认，尚未收复）"})
         m = s["flags"].get("migration")
         if m:
-            out[m["dir"]].append(("migration", f"盘中Flip{'上移' if m['dir'] == 'up' else '下移'} {m['df']:+.2f}"))
+            t = f"盘中Flip{'上移' if m['dir'] == 'up' else '下移'} {m['df']:+.2f}"
+            out[m["dir"]].append({"tag": "migration", "t": None, "n": None, "name": t, "text": t})
         w = s["flags"].get("wall_shift")
         if w:
-            out[w["dir"]].append(("wall_shift", f"墙位同向{'上移' if w['dir'] == 'up' else '下移'}"))
+            t = f"墙位同向{'上移' if w['dir'] == 'up' else '下移'}"
+            out[w["dir"]].append({"tag": "wall_shift", "t": None, "n": None, "name": t, "text": t})
         return out
+
+    def struct_evidence(self, now) -> dict:
+        rows = self.struct_rows(now)
+        return {d: [(r["tag"], r["text"]) for r in rows[d]] for d in ("up", "down")}
 
     def categories(self, now, d):
         cfg, evs = self.cfg, self.s["events"]
@@ -1397,7 +1676,8 @@ class Engine:
         tags = {t for t, _ in st}
         # 必须有"真实的穿越/突破"才算结构确认；Flip 迁移、墙位移动只是辅助证据（防止随价格漂移造成误判）
         struct_ok = ("flip_cross" in tags) or ("wall_break" in tags)
-        mom = [e for e in evs if e["dir"] == d and e["kind"] in ("impulse", "continuation")
+        mom_kinds = ("impulse", "continuation", "fastmove") if cfg.fastmove else ("impulse", "continuation")
+        mom = [e for e in evs if e["dir"] == d and e["kind"] in mom_kinds
                and self.age_min(e["t"], now) <= cfg.conf_window_min]
         flow = [e for e in evs if e["dir"] == d and e["kind"] in ("tide", "prints", "mega")
                 and self.age_min(e["t"], now) <= cfg.conf_window_min]
@@ -1427,18 +1707,94 @@ class Engine:
             if not kind:
                 continue
             text = self.build_confluence(now, P, d, struct_ok, st, mom, flow, count, kind, run)
-            self.queue_push(now, "conf" if kind == "new" else "conf_run", text, silent=False, P=P, d=d)
+            self.queue_push(now, "conf" if kind == "new" else "conf_run", text, silent=False, P=P, d=d,
+                            brief=self.conf_title(now, d, count, kind) if cfg.fmt_v2 else None)
             s["last_push"][f"conf_{d}"] = iso(now)
             anchored = any(b["d"] == d for b in s["breaks"])      # 有尚未被收复的真实突破作锚点
             if kind == "new":
                 s["run"] = {"dir": d, "start": iso(now), "start_price": P, "last_push": iso(now), "last_price": P,
                             "tier": count, "pushes": 1, "extreme": P, "anchored": anchored}
+                if cfg.invalid_v2:
+                    self.init_run_v2(s["run"], now, P, d)
             else:
                 run.update(last_push=iso(now), last_price=P, tier=max(run["tier"], count), pushes=run["pushes"] + 1)
             pushed.append(d)
         return pushed
 
+    # ---------- 信号失效 v2：先"转弱"（静音提示），再"失效"（响铃） ----------
+    def init_run_v2(self, run, now, P, d):
+        """给一个进行中的信号记下判断"转弱 / 失效"要用的基准：
+        level = 触发这次信号的突破位（最近一次未被收复的 Flip 区边缘 / Call·Put Wall）；没有结构突破时，用首次提醒价。
+        origin / swing = 这波走势的起点（20 分钟内的低点/高点）；之后每出现一次"回落—反弹"，swing 就上移（下跌信号则下移）。"""
+        cfg = self.cfg
+        brk = [b for b in self.s["breaks"] if b["d"] == d]
+        if brk:
+            b = max(brk, key=lambda x: x["t"])
+            run["level"], run["lvl_name"] = b["level"], b["label"]
+        else:
+            run["level"], run["lvl_name"] = P, "首次提醒价"
+        ts = now.timestamp()
+        win = [p for (t, p) in self.s["px_hist"] if t >= ts - cfg.conf_window_min * 60] or [P]
+        run["origin"] = min(win) if d == "up" else max(win)
+        run["swing"] = run["origin"]
+        run["zz"] = {"ext": P, "ret": P}
+
+    def swing_update(self, run, P):
+        """极简之字形：上涨信号里，价格从高点回落 ≥ SWING_MIN_PCT 后又反弹 ≥ SWING_MIN_PCT，这个回落低点就算"一次回落"，swing 取更高者。"""
+        pct = self.cfg.swing_min_pct / 100.0
+        zz = run.setdefault("zz", {"ext": P, "ret": P})
+        if run["dir"] == "up":
+            if P > zz["ext"]:
+                zz["ext"] = zz["ret"] = P
+            else:
+                zz["ret"] = min(zz["ret"], P)
+                if zz["ext"] - zz["ret"] >= zz["ext"] * pct and P - zz["ret"] >= zz["ret"] * pct:
+                    run["swing"] = zz["ret"] if run.get("swing") is None else max(run["swing"], zz["ret"])
+                    zz["ext"] = zz["ret"] = P
+        else:
+            if P < zz["ext"]:
+                zz["ext"] = zz["ret"] = P
+            else:
+                zz["ret"] = max(zz["ret"], P)
+                if zz["ret"] - zz["ext"] >= zz["ext"] * pct and zz["ret"] - P >= zz["ret"] * pct:
+                    run["swing"] = zz["ret"] if run.get("swing") is None else min(run["swing"], zz["ret"])
+                    zz["ext"] = zz["ret"] = P
+
+    def check_run_v2(self, now, P):
+        cfg, s = self.cfg, self.s
+        run = s["run"]
+        if not run:
+            return
+        d = run["dir"]
+        sgn = 1 if d == "up" else -1
+        ts = now.timestamp()
+        run["extreme"] = max(run["extreme"], P) if d == "up" else min(run["extreme"], P)
+        if "level" not in run:                                   # 兼容：旧版遗留的进行中信号
+            self.init_run_v2(run, now, run.get("start_price") or P, d)
+        L = run["level"]
+        off = (L - P) * sgn                                      # >0：价格回到了基准位的另一侧
+        buf = L * cfg.weak_buf_pct / 100.0
+        run["wrong_since"] = (run.get("wrong_since") or ts) if off > 0 else None
+        run["weak_since"] = (run.get("weak_since") or ts) if off >= buf else None
+        self.swing_update(run, P)
+        sw = run.get("swing")
+        run["swing_since"] = (run.get("swing_since") or ts) if (sw is not None and (sw - P) * sgn > 0) else None
+        reason = None
+        if run["wrong_since"] and ts - run["wrong_since"] >= cfg.invalid_hold_min * 60:
+            reason = (f"价格回到 {run['lvl_name']} {L:.2f} 的{'下' if d == 'up' else '上'}方已超过 {cfg.invalid_hold_min:.0f} 分钟（突破失败）")
+        elif run["swing_since"] and ts - run["swing_since"] >= cfg.swing_confirm_s:
+            reason = (f"价格{'跌破最近一次回落低点' if d == 'up' else '突破最近一次反弹高点'} {sw:.2f} 并站稳 {cfg.swing_confirm_s:.0f}秒")
+        if reason:
+            self.queue_push(now, "invalid", self.build_invalid(now, P, run, reason), silent=not cfg.loud_tiers)
+            s["run"] = None
+            return
+        if run.get("weak_since") and ts - run["weak_since"] >= cfg.weak_hold_s and not run.get("weak_sent"):
+            run["weak_sent"] = iso(now)
+            self.queue_push(now, "weak", self.build_weak(now, P, run), silent=True)
+
     def check_run(self, now, P):
+        if self.cfg.invalid_v2:
+            return self.check_run_v2(now, P)
         cfg, s = self.cfg, self.s
         run = s["run"]
         if not run:
@@ -1464,13 +1820,23 @@ class Engine:
         cfg = self.cfg
         for e in self.new_events:
             d, kind = e["dir"], e["kind"]
+            if kind == "fastmove":
+                if d in conf_dirs:
+                    continue                      # 同方向的共振提醒已经带上了这次快速异动
+                self.queue_push(now, "fastmove", self.build_fastmove(now, P, e), silent=False, P=P, d=d, brief=e["text"])
+                continue
             if kind == "mega":
                 if d in conf_dirs:
                     continue
                 if self.cooldown_ok(now, f"mega_{d}", cfg.mega_cooldown_min):
                     self.s["last_push"][f"mega_{d}"] = iso(now)
-                    self.queue_push(now, "mega", self.build_simple(now, P, "🐋", f"{cfg.symbol} 巨额单", e["text"]), silent=False,
-                                    P=P, d=d, brief=e["text"])
+                    if cfg.whale_0dte_only:
+                        buy = e.get("side") == "ask"          # 买方（主动买入）响铃；卖方 / 买卖不明静音
+                        self.queue_push(now, "mega", self.build_whale(now, P, e), silent=bool(cfg.loud_tiers and not buy),
+                                        P=P, d=d, brief=e["text"])
+                    else:
+                        self.queue_push(now, "mega", self.build_simple(now, P, "🐋", f"{cfg.symbol} 巨额单", e["text"]), silent=False,
+                                        P=P, d=d, brief=e["text"])
                 continue
             if d in conf_dirs:
                 continue
@@ -1482,11 +1848,319 @@ class Engine:
                 want = True
             elif cfg.push_single == "structure" and kind in ("flip_cross", "wall_break"):
                 want = True
-            if want and self.cooldown_ok(now, f"single_{kind}_{d}", cfg.single_cooldown_min):
+            if not want:
+                continue
+            if cfg.loud_tiers and kind in ("flip_cross", "wall_break"):
+                # 同一位置：首次确认响铃；30 分钟内再次确认 → 静音，只标"第 N 次"（不再套用旧的 15 分钟冷却）
+                n, prev = e.get("n") or 1, e.get("prev_ago")
+                repeat = n >= 2 and prev is not None and prev <= cfg.merge_min
+                text = self.build_struct(now, P, e) if cfg.fmt_v2 else self.build_simple(
+                    now, P, "⚡", f"{cfg.symbol} 结构事件" + (f"（第{n}次）" if n >= 2 else ""), e["text"],
+                    "目前仅为单一信号；动量 / 资金流同向时会另发“共振”提醒")
+                self.queue_push(now, "single", text, silent=repeat, P=P, d=d, brief=e["text"])
+            elif self.cooldown_ok(now, f"single_{kind}_{d}", cfg.single_cooldown_min):
                 self.s["last_push"][f"single_{kind}_{d}"] = iso(now)
-                note = "目前仅为单一信号；动量 / 资金流同向时会另发“共振”提醒"
-                self.queue_push(now, "single", self.build_simple(now, P, "⚡", f"{cfg.symbol} {'结构' if kind in ('flip_cross', 'wall_break') else '信号'}事件", e["text"], note),
-                                silent=False, P=P, d=d, brief=e["text"])
+                if cfg.fmt_v2:
+                    text = self.build_struct(now, P, e)
+                else:
+                    note = "目前仅为单一信号；动量 / 资金流同向时会另发“共振”提醒"
+                    text = self.build_simple(now, P, "⚡", f"{cfg.symbol} {'结构' if kind in ('flip_cross', 'wall_break') else '信号'}事件", e["text"], note)
+                self.queue_push(now, "single", text, silent=False, P=P, d=d, brief=e["text"])
+
+    # ================= v2 版面：标题 + 一句话结论 + 五点位梯子 + 结构 / 资金 / 动量 三块 =================
+    def ladder_lines(self, P) -> list:
+        """五点位梯子（等宽块里一行一个，按价格从高到低）：Gamma Flip、Call Wall、现价、Put Wall、磁吸。
+        数字在前、名称在行尾（中文放行尾，数字列才不会错位）；离现价超过 FAR_PCT 的点位标"远"；缺哪个点位就不显示哪一行。"""
+        v, s, cfg = self.view, self.s, self.cfg
+        prim = v.get("prim") or {}
+        zone = s["zone"].get("last")
+        items = []
+        flip = zone["center"] if zone else prim.get("flip")
+        if flip is not None:
+            items.append((flip, "Gamma Flip"))
+        if prim.get("call") is not None:
+            items.append((prim["call"], "Call Wall"))
+        if prim.get("put") is not None:
+            items.append((prim["put"], "Put Wall"))
+        if prim.get("magnet") is not None:
+            items.append((prim["magnet"], "磁吸"))
+        rows = [(px, nm, False) for px, nm in items] + [(P, "现价", True)]
+        rows.sort(key=lambda r: -r[0])                    # 稳定排序：和某个点位同价时，现价排在它后面
+        out = []
+        for px, nm, is_px in rows:
+            if is_px:
+                out.append(f"{px:7.2f} {'=' * 13}  现价")
+            else:
+                dlt = px - P
+                pc = dlt / P * 100.0
+                far = abs(pc) > cfg.far_pct
+                dlt, pc = round(dlt, 2) + 0.0, round(pc, 1) + 0.0         # "+ 0.0" 把 -0.0 变成 0.0，避免显示 "-0.0%"
+                out.append(f"{px:7.2f} {dlt:+6.2f} {pc:+5.1f}%  {nm}" + (" 远" if far else ""))
+        return out
+
+    def move_since(self, minutes, now, P):
+        """最近 N 分钟的价格变化 (美元, 起点价)；价格样本不足（不到 N 分钟的一半）返回 None。"""
+        ph = self.s["px_hist"]
+        if not ph or P is None:
+            return None
+        ts = now.timestamp()
+        target = ts - minutes * 60
+        ref = None
+        for t, p in ph:
+            if t <= target:
+                ref = p
+            else:
+                break
+        if ref is None:
+            t0, p0 = ph[0]
+            if ts - t0 < 0.5 * minutes * 60:
+                return None
+            ref = p0
+        return P - ref, ref
+
+    def x0_view(self, now):
+        """UW 0DTE 当日汇总（flow-per-expiry）：数据日期必须是今天、且 5 分钟内取到过，否则不用（退回过渡口径）。"""
+        x = self.view.get("x0")
+        if not x or not x.get("ok"):
+            return None
+        t = parse_iso(x.get("fetched"))
+        if t is None or (now - t).total_seconds() > 300:
+            return None
+        return x
+
+    def struct_row_text(self, r, now) -> str:
+        meta = []
+        if r.get("t"):
+            t = parse_iso(r["t"])
+            ag = (now - t).total_seconds()
+            meta.append(f"{hm(t)}确认")
+            if ag >= 60:                                  # 刚确认的那一刻"持续 0 秒"没有信息量，不显示
+                meta.append(f"持续{age_short(ag)}")
+            if ag / 60.0 > self.cfg.old_min:
+                meta.append("旧")
+        if r.get("n") and r["n"] >= 2:
+            meta.append(f"第{r['n']}次")
+        return r["name"] + ("｜" + "｜".join(meta) if meta else "")
+
+    def v2_struct_segs(self, now, P, d=None) -> list:
+        s = self.s
+        rows = self.struct_rows(now)
+        segs = [("b", "【结构】")]
+        lines = []
+        if d:
+            lines += ["✓ " + self.struct_row_text(r, now) for r in rows[d]]
+            lines += ["↔ 反向 " + self.struct_row_text(r, now) for r in rows["down" if d == "up" else "up"]]
+            if not rows[d]:
+                lines.insert(0, "✗ 本方向暂无已确认的穿越 / 破位")
+        else:
+            for dd, mk in (("up", "▲ "), ("down", "▼ ")):
+                lines += [mk + self.struct_row_text(r, now) for r in rows[dd]]
+        zone, side = s["zone"].get("last"), s["zone"].get("side")
+        if not lines or (not d and not any(rows.values())):
+            if zone and side:
+                lines.append(f"价格在 Flip 区{'上方' if side == 'above' else '下方'}（{P - zone['center']:+.2f}），暂无新的穿越 / 破位确认")
+            else:
+                lines.append("（Flip 数据缺失 / 暂无结构信号）")
+        for ln in lines[:5]:
+            segs.append(("t", ln))
+        return segs
+
+    def v2_flow_segs(self, now, P, d=None, detail: bool = False) -> list:
+        """资金块：只看当天到期（0DTE）的买 Call / 买 Put 总额（BUY / SELL × CALL / PUT）。
+        优先用 UW 的 0DTE 当日汇总；读不到时退回"0DTE 大单当日累计 + 全到期近 10 分钟净额"，并明确标注是过渡口径。"""
+        cfg, s, v = self.cfg, self.s, self.view
+        f = s["flow"]
+        tide = v.get("tide")
+        segs = []
+        if cfg.flow_v2:
+            x0 = self.x0_view(now)
+            if x0:
+                segs.append(("b", "【资金】0DTE 当日累计（UW 汇总）"))
+                segs.append(("pre", [f"{'':<5}{'CALL':>9}{'PUT':>9}",
+                                     f"{'BUY':<5}{money(x0['ca']):>9}{money(x0['pa']):>9}",
+                                     f"{'SELL':<5}{money(x0['cb']):>9}{money(x0['pb']):>9}"]))
+                segs.append(("t", f"买方比 CALL : PUT = {ratio_text(x0['ca'], x0['pa'])}"))
+            else:
+                day0 = f.get("day0") or {}
+                segs.append(("b", f"【资金】0DTE 大单当日累计（单笔≥{money(cfg.print_min)}｜过渡口径）"))
+
+                def cell(k):
+                    m = day0.get(k)
+                    return f"{money(m[0])}({m[1]})" if m else "—"
+
+                if any(k in day0 for k in ("buy_call", "buy_put", "sell_call", "sell_put")):
+                    segs.append(("pre", [f"{'':<5}{'CALL':>12}{'PUT':>12}",
+                                         f"{'BUY':<5}{cell('buy_call'):>12}{cell('buy_put'):>12}",
+                                         f"{'SELL':<5}{cell('sell_call'):>12}{cell('sell_put'):>12}"]))
+                else:
+                    segs.append(("t", "今日暂无符合条件的 0DTE 大单（括号内是笔数）"))
+                if tide and tide.get("ncp_win") is not None:
+                    segs.append(("t", f"近{cfg.tide_window_min:.0f}分钟全到期净额：Call净 {money(tide['ncp_win'], True)}｜Put净 {money(tide['npp_win'], True)}"
+                                      f"｜CALL : PUT = {ratio_text(tide['ncp_win'], tide['npp_win'])}（全到期净额·过渡口径）"))
+                else:
+                    segs.append(("t", "买方比 CALL : PUT = —（净权利金基线积累中 / 暂无数据）"))
+        else:
+            segs.append(("b", "【资金】"))
+            segs.append(("t", self.flow_status_text()))
+            dm = f.get("day_mix")
+            if dm:
+                segs.append(("t", f"全天大单（≥{money(cfg.print_min)}）：" + mix_text(dm)))
+        evs = [e for e in s["events"] if e["kind"] in ("tide", "prints", "mega") and self.age_min(e["t"], now) <= cfg.conf_window_min
+               and (d is None or e["dir"] == d)]
+        if d:
+            if evs:
+                for e in evs[-2:]:
+                    segs.append(("t", "✓ " + e["text"]))
+            else:
+                segs.append(("t", "✗ 暂无同向资金信号：" + self.flow_status_text()))
+        else:
+            for e in evs[-2:]:
+                segs.append(("t", f"{'▲' if e['dir'] == 'up' else '▼'} {hm(parse_iso(e['t']))} {e['text']}"))
+            if detail:
+                segs.append(("t", self.flow_status_text()))
+            if cfg.flow_v2:
+                for it in (f.get("last0") or [])[-2:]:
+                    st = f"{it['strike']:g}" if it.get("strike") is not None else "?"
+                    side = {"ask": "BUY", "bid": "SELL"}.get(it.get("side"), "MIX")
+                    segs.append(("t", f"最新 {hm(parse_iso(it['t']))} {side} {(it.get('type') or '?').upper()} {st} {money(it['prem'])}"))
+        return segs
+
+    def v2_mom_segs(self, now, P, d=None) -> list:
+        cfg, s = self.cfg, self.s
+        segs = [("b", "【动量】")]
+        parts = []
+        for m in (10, 20):
+            r = self.move_since(m, now, P)
+            if r is not None:
+                parts.append(f"{m}分钟 {r[0]:+.2f}（{r[0] / r[1] * 100:+.2f}%）")
+        o = s["session"].get("open")
+        if o:
+            parts.append(f"较开盘 {P - o:+.2f}（{pct_change(P, o):+.2f}%）")
+        segs.append(("t", "｜".join(parts) if parts else "（价格样本积累中）"))
+        fm = s.get("fm")
+        if cfg.fastmove and fm and not d and self.age_min(fm["last_t"], now) <= 30:
+            cum = fm["last_px"] - fm["first_px"]
+            segs.append(("t", f"快速异动：{'上行' if fm['dir'] == 'up' else '下行'} 第{fm['n']}次｜自 {hm(parse_iso(fm['first_t']))} 起累计 {cum:+.2f}｜最近一次 {hm(parse_iso(fm['last_t']))}"))
+        if d:
+            mk = ("impulse", "continuation", "fastmove") if cfg.fastmove else ("impulse", "continuation")
+            evs = [e for e in s["events"] if e["dir"] == d and e["kind"] in mk and self.age_min(e["t"], now) <= cfg.conf_window_min]
+            if evs:
+                for e in evs[-2:]:
+                    segs.append(("t", "✓ " + e["text"]))
+            else:
+                segs.append(("t", "✗ 暂无同向动量信号：" + self.mom_status_text(P)))
+        return segs
+
+    def v2_build(self, now, P, title, verdict, d=None, extra=None, blocks=("struct", "flow", "mom")):
+        """统一版面：第 1 行标题、第 2 行一句话结论（手机锁屏预览只显示这两行）、第 3 行起五点位梯子，然后结构 / 资金 / 动量三块。"""
+        segs = [("b", title), ("t", verdict), ("pre", self.ladder_lines(P))]
+        if extra:                                   # 补充说明放在梯子后面：第 1、2 行永远是标题 + 结论，第 3 行起永远是梯子
+            segs.extend(extra)
+        if "struct" in blocks:
+            segs.extend(self.v2_struct_segs(now, P, d))
+        if "flow" in blocks:
+            segs.extend(self.v2_flow_segs(now, P, d))
+        if "mom" in blocks:
+            segs.extend(self.v2_mom_segs(now, P, d))
+        dt = self.data_times_line(now)
+        if dt:
+            segs.append(("t", dt))
+        segs.append(("t", DISCLAIMER))
+        html = self.cfg.fmt_v2
+        out = render_segs(segs, html=html)
+        return HTMLText(out) if html else out
+
+    def conf_title(self, now, d, count, kind) -> str:
+        cfg = self.cfg
+        if kind == "continue":
+            return f"🔁 {cfg.symbol} 共振延续 {dir_label(d)} · {count}/3 · {hm(now)} ET"
+        if kind == "upgrade":
+            return f"🔔⬆ {cfg.symbol} 共振升级 {dir_label(d)} · {count}/3 · {hm(now)} ET"
+        return f"🔔 {cfg.symbol} 共振 {dir_label(d)} · {count}/3 · {hm(now)} ET"
+
+    def v2_confluence(self, now, P, d, struct_ok, st, mom, flow, count, kind, run):
+        rows = self.struct_rows(now)[d]
+        marks = f"结构{'✓' if struct_ok else '✗'} 动量{'✓' if mom else '✗'} 资金{'✓' if flow else '✗'}"
+        key = rows[0]["name"] if (struct_ok and rows) else ("" if not mom else mom[-1]["text"].split("（")[0])
+        verdict = f"{marks}｜现价 {P:.2f}" + (f"｜{key}" if key else "")
+        extra = []
+        if kind == "continue" and run:
+            extra.append(("t", f"自 {hm(parse_iso(run['start']))} 首次提醒起，价格 {run['start_price']:.2f}→{P:.2f}（{pct_change(P, run['start_price']):+.2f}%）"))
+        elif kind == "new" and run and run.get("dir") in ("up", "down") and run["dir"] != d and self.cfg.invalid_v2:
+            # 反向共振出现时旧信号被直接取代（不会再有"转弱/失效"提醒）：在这条提醒里说明，不另发消息
+            extra.append(("t", f"↩ 上一个{dir_label(run['dir'])}信号（{hm(parse_iso(run['start']))} 起 {run['start_price']:.2f}→{P:.2f}，"
+                               f"{pct_change(P, run['start_price']):+.2f}%）已被这次反向共振取代"))
+        return self.v2_build(now, P, self.conf_title(now, d, count, kind), verdict, d=d, extra=extra)
+
+    def build_whale(self, now, P, e):
+        cfg = self.cfg
+        if not cfg.fmt_v2:
+            return self.build_simple(now, P, "🐋", f"{cfg.symbol} 0DTE 巨额单", e["text"])
+        d, buy = e["dir"], e.get("side") == "ask"
+        lab = dir_label(d) if d in ("up", "down") else "方向不明"
+        head = f"🐋 {cfg.symbol} 0DTE 巨额单{'' if buy else '（卖出）'} {lab} · {hm(now)} ET"
+        g = []
+        if e.get("delta") is not None:
+            g.append(f"Δ{e['delta']:+.2f}")
+        if e.get("iv") is not None:
+            iv = e["iv"] * 100 if e["iv"] < 3 else e["iv"]
+            g.append(f"IV {iv:.1f}%")
+        verdict = e["text"] + f"｜现价 {P:.2f}" + (("｜" + " ".join(g)) if g else "")
+        return self.v2_build(now, P, head, verdict)
+
+    def build_fastmove(self, now, P, e):
+        cfg = self.cfg
+        if not cfg.fmt_v2:
+            return self.build_simple(now, P, "💨", f"{cfg.symbol} 快速异动", e["text"])
+        d, n = e["dir"], e.get("n") or 1
+        head = f"💨 {cfg.symbol} 快速{'拉升' if d == 'up' else '下杀'} {dir_label(d)}" + (f" · 第{n}次" if n >= 2 else "") + f" · {hm(now)} ET"
+        verdict = (f"{cfg.fm_window_min:.0f}分钟 {e['move']:+.2f}（{e['ref']:.2f}→{P:.2f}）"
+                   + (f"｜自 {hm(parse_iso(e['first_t']))} 首次累计 {e['cum']:+.2f}" if n >= 2 else "") + f"｜门槛 ±{e['thr']:.2f}")
+        return self.v2_build(now, P, head, verdict)
+
+    def build_struct(self, now, P, e):
+        cfg = self.cfg
+        d, kind, n, prev = e["dir"], e["kind"], e.get("n") or 1, e.get("prev_ago")
+        if kind == "wall_break":
+            nm = f"{'Call' if d == 'up' else 'Put'} Wall {e['level']:.2f} {'上破' if d == 'up' else '下破'}"
+        elif kind == "flip_cross":
+            nm = f"Flip区{'向上' if d == 'up' else '向下'}穿越"
+        else:
+            nm = KIND_NAME.get(kind, kind)
+        head = f"⚡ {cfg.symbol} {nm} {dir_label(d)}" + (f" · 第{n}次" if n >= 2 else "") + f" · {hm(now)} ET"
+        parts = [f"现价 {P:.2f}"]
+        if kind == "wall_break" and e.get("level") is not None:
+            parts.append(f"已越过 {abs(P - e['level']):.2f}")
+        if e.get("held") is not None:
+            parts.append(f"站稳 {e['held']}秒后确认")
+        if n >= 2 and prev is not None:
+            parts.append(f"距上次 {age_short(prev * 60)}" + ("（静音）" if prev <= cfg.merge_min else ""))
+        if kind not in ("flip_cross", "wall_break"):
+            parts.append(e["text"])
+        else:
+            parts.append("单一信号，动量 / 资金同向时会另发共振")
+        return self.v2_build(now, P, head, "｜".join(parts))
+
+    def build_weak(self, now, P, run):
+        cfg = self.cfg
+        d, L = run["dir"], run["level"]
+        head = f"↩ {cfg.symbol} {dir_label(d)}信号转弱 · {hm(now)} ET（静音提示）"
+        verdict = (f"价格已收复 {run['lvl_name']} {L:.2f} 达 {cfg.weak_buf_pct:g}%（{abs(P - L):.2f}）并站稳 {cfg.weak_hold_s / 60:g}分钟｜现价 {P:.2f}")
+        tail = (f"自 {hm(parse_iso(run['start']))} 首次提醒起 {run['start_price']:.2f}→{P:.2f}（{pct_change(P, run['start_price']):+.2f}%）｜"
+                f"尚未失效；失效 = 回到该位置另一侧超 {cfg.invalid_hold_min:.0f}分钟，或{'跌破回落低点' if d == 'up' else '突破反弹高点'} {run.get('swing', P):.2f}")
+        if not cfg.fmt_v2:
+            return "\n".join([head, verdict, tail, DISCLAIMER])
+        return self.v2_build(now, P, head, verdict, extra=[("t", tail)])
+
+    def build_invalid(self, now, P, run, reason):
+        cfg = self.cfg
+        d = run["dir"]
+        move = pct_change(P, run["start_price"])
+        head = f"↩ {cfg.symbol} {dir_label(d)}信号失效 · {hm(now)} ET"
+        tail = f"自 {hm(parse_iso(run['start']))} 首次提醒起，价格 {run['start_price']:.2f}→{P:.2f}（{move:+.2f}%）｜期间共提醒 {run.get('pushes', 1)} 次"
+        if not cfg.fmt_v2:
+            return "\n".join([head, f"原因：{reason}", tail, DISCLAIMER])
+        return self.v2_build(now, P, head, f"原因：{reason}｜现价 {P:.2f}", extra=[("t", tail)])
 
     # ---------- 文本构造 ----------
     def levels_lines(self, P) -> str:
@@ -1527,6 +2201,8 @@ class Engine:
 
     def build_confluence(self, now, P, d, struct_ok, st, mom, flow, count, kind, run) -> str:
         cfg = self.cfg
+        if cfg.fmt_v2:
+            return self.v2_confluence(now, P, d, struct_ok, st, mom, flow, count, kind, run)
         if kind == "continue":
             head = f"🔁 {cfg.symbol} 共振延续 {dir_label(d)} · {count}/3 · {hm(now)} ET"
         elif kind == "upgrade":
@@ -1571,9 +2247,53 @@ class Engine:
         t = v.get("tide")
         if t and t.get("last"):
             parts.append(f"资金流{hm(t['last'])}")
+        x0 = self.x0_view(now)                       # 只有资金块真正在用（当天数据、5 分钟内取到）时才标注，过期的不冒充
+        if x0 and x0.get("fetched"):
+            parts.append(f"0DTE汇总{hm(parse_iso(x0['fetched']))}")
         return "数据时间(ET)：" + " · ".join(parts) if parts else ""
 
+    def build_close_digest_v2(self, now):
+        cfg, s = self.cfg, self.s
+        ss, v = s["session"], self.view
+        P = v.get("P") or ss.get("high")
+        evs = s["day_events"]
+        c = s["counters"]
+        segs = [("b", f"📉 {cfg.symbol} 收盘摘要 · {s['date']}")]
+        if ss["open"] is not None and P is not None:
+            segs.append(("t", f"开盘读数 {ss['open']:.2f} → 现价 {P:.2f}（{pct_change(P, ss['open']):+.2f}%）｜日内高 {ss['high']:.2f} 低 {ss['low']:.2f}"
+                              f"（振幅 {ss['high'] - ss['low']:.2f}）"))
+        else:
+            segs.append(("t", "今日没有足够的价格数据"))
+        if P is not None:
+            segs.append(("pre", self.ladder_lines(P)))
+        segs.append(("b", "【结构】今日事件"))
+        key_ev = [e for e in evs if e["kind"] in ("flip_cross", "wall_break")][-8:]
+        for e in key_ev:
+            n = e.get("n")
+            segs.append(("t", f"{hm(parse_iso(e['t']))} {e['text'].splitlines()[0]}" + (f"｜第{n}次" if n and n >= 2 else "")))
+        if not key_ev:
+            segs.append(("t", "今日无 Flip 穿越 / 墙位突破"))
+        if P is not None:
+            segs.extend(self.v2_flow_segs(now, P, None))
+        td = v.get("tide_day")
+        if td:
+            segs.append(("t", f"全到期全天净权利金：Call净 {money(td['ncp'], True)}｜Put净 {money(td['npp'], True)}（Put净为正 = 买 put 多于卖 put）"))
+        segs.append(("b", "【动量】"))
+        n_fm = sum(1 for e in evs if e["kind"] == "fastmove")
+        segs.append(("t", f"快速异动 {n_fm} 次" + ("（同方向连续提醒已计入）" if n_fm else "")))
+        g = s.get("greek")
+        if g:
+            segs.append(("t", f"日度净Gamma（OI口径）：{'偏正' if g['net'] > 0 else '偏负'}（净占比 {g['ratio'] * 100:+.0f}%）"))
+        counts = [f"{KIND_NAME[k]} {c.get('k_' + k, 0)}" for k in ("conf", "conf_run", "single", "mega", "fastmove", "weak", "invalid") if c.get("k_" + k)]
+        segs.append(("t", "今日提醒：" + ("｜".join(counts) if counts else "无") + f"（响铃 {c['pushed']} 条｜静音 {c['silent']} 条，含本条之前）"))
+        segs.append(("t", DISCLAIMER))
+        html = cfg.fmt_v2
+        out = render_segs(segs, html=html)
+        return HTMLText(out) if html else out
+
     def build_close_digest(self, now) -> str:
+        if self.cfg.fmt_v2:
+            return self.build_close_digest_v2(now)
         cfg, s = self.cfg, self.s
         ss, v = s["session"], self.view
         P = v.get("P") or ss.get("high")
@@ -1640,7 +2360,10 @@ class Engine:
         stale = (P is None) or (price_age is not None and price_age > cfg.stale_price_s and not closed and not force)
         self.view = {"P": P, "q": q, "price_age": price_age, "closed": closed, "stale": stale, "force": force,
                      "prim": snap.get("primary"), "live": snap.get("live"), "wall_src": snap.get("wall_src"), "tide": None, "prints": None,
-                     "caps": snap.get("caps", {})}
+                     "caps": snap.get("caps", {}), "x0": snap.get("x0"), "tide_day": None}
+        tk = snap.get("ticks")
+        if tk:                                                                      # 全到期全天净权利金（收盘摘要用）
+            self.view["tide_day"] = {"ncp": sum(t["ncp"] for t in tk), "npp": sum(t["npp"] for t in tk)}
         expect_live = in_window(now, cfg) and not force
 
         # --- 数据中断检测 ---
@@ -1662,7 +2385,8 @@ class Engine:
         # --- 其它一次性告警（权限/认证） ---
         for msg_key, msg in (snap.get("notices") or {}).items():
             if self.once_per_day(msg_key):
-                self.queue_push(now, "notice", f"⚠ {cfg.symbol} 监控提示 · {hm(now)} ET\n{msg}", silent=False)
+                # cap_x0（0DTE 汇总读不到）只是退回过渡口径，静音提示即可
+                self.queue_push(now, "notice", f"⚠ {cfg.symbol} 监控提示 · {hm(now)} ET\n{msg}", silent=(msg_key == "cap_x0"))
 
         # --- 收盘摘要（转换为非常规时段，或到点） ---
         if not force and not s["digest_close"] and s["session"]["open"] is not None:
@@ -1691,6 +2415,8 @@ class Engine:
         self.update_walls(now, P, prev_P, prim)
         self.update_breaks(now, P)
         self.update_impulse(now, P)
+        if cfg.fastmove:
+            self.update_fastmove(now, P)
         self.update_momentum(now, P)
         self.update_structure_edges(now, P)
         self.update_flow(now, P, snap)
@@ -1714,7 +2440,92 @@ def wall_text(prim: dict, key: str, P: float, strike_mode: bool) -> str:
     return t
 
 
+def render_panel_v2(eng: Engine, now):
+    """实时面板 v2：和提醒同一套版面（标题 → 五点位梯子 → 结构 / 资金 / 动量），再加"共振"状态与最近信号。"""
+    cfg, s, v = eng.cfg, eng.s, eng.view
+    P = v.get("P")
+    segs = [("b", f"📊 {cfg.symbol} 实时面板 · {hm(now, True)} ET")]
+    if v.get("force"):
+        segs.append(("t", "🧪 测试模式：非交易时段，下面是最近一个交易日的数据"))
+    elif v.get("closed"):
+        segs.append(("t", "💤 当前不在常规交易时段（盘前/盘后/休市），信号暂停"))
+    elif v.get("stale"):
+        segs.append(("t", "⚠ 价格数据异常或过旧，信号暂停"))
+    if P is None:
+        segs.append(("t", "现价：暂无"))
+    else:
+        ss = s["session"]
+        if ss["open"] is not None:
+            segs.append(("t", f"现价 {P:.2f}｜较开盘读数 {pct_change(P, ss['open']):+.2f}%｜高 {ss['high']:.2f} 低 {ss['low']:.2f}"))
+        else:
+            segs.append(("t", f"现价 {P:.2f}"))
+        segs.append(("pre", eng.ladder_lines(P)))
+        prim, live = v.get("prim"), v.get("live")
+        notes = [f"点位口径：{SRC_LABEL.get(cfg.primary_src, cfg.primary_src)}"]
+        if prim and v.get("wall_src") == "strike":
+            notes.append("墙位=按行权价 OI Gamma 近端峰值")
+            mxs = [f"{nm} {prim[k + '_max']:g}" for k, nm in (("call", "Call"), ("put", "Put"))
+                   if prim.get(k + "_max") is not None and prim.get(k) is not None and abs(prim[k + "_max"] - prim[k]) >= 0.5]
+            if mxs:
+                notes.append("最大墙：" + "／".join(mxs))
+            pins = prim.get("pins") or []
+            if pins:
+                notes.append(f"近处大持仓（<{cfg.wall_min_pct:g}%，按磁吸位处理）：" + "、".join(f"{p['strike']:g}" for p in pins))
+        elif prim and cfg.wall_mode == "strike":
+            notes.append("按行权价数据暂不可用，暂用 UW 自带的 Call/Put Wall")
+        elif not prim:
+            notes.append("点位数据暂不可用")
+        segs.append(("t", "｜".join(notes)))
+        if live and live is not prim:
+            segs.append(("t", f"盘中·{SRC_LABEL.get(cfg.live_src, cfg.live_src)}：Flip {fpx(live.get('flip'))}｜Call {fpx(live.get('call'))}｜Put {fpx(live.get('put'))}"))
+        g = s.get("greek")
+        if g:
+            segs.append(("t", f"日度净Gamma(OI)：{'偏正（压制波动倾向）' if g['net'] > 0 else '偏负（放大波动倾向）'}｜净占比 {g['ratio'] * 100:+.0f}%"))
+        segs.extend(eng.v2_struct_segs(now, P, None))
+        segs.extend(eng.v2_flow_segs(now, P, None, detail=True))
+        segs.extend(eng.v2_mom_segs(now, P, None))
+        fm = v.get("fm")
+        if fm:
+            segs.append(("t", f"快速异动门槛 ±{fm['thr']:.2f}：{cfg.fm_window_min:.0f}分钟自低点 {fm['up']:+.2f}｜自高点 {fm['dn']:+.2f}"))
+        for b in s["breaks"][-2:]:
+            prog = abs(pct_change(P, b["level"]))
+            segs.append(("t", f"追踪：{b['label']}{'上破' if b['d'] == 'up' else '下破'}（{b['level']:.2f}，{hm(parse_iso(b['t']))}）后已延伸 {prog:.2f}%（下一档 {b['next']:.2f}%）"))
+    segs.append(("b", "【共振】"))
+    for d in ("up", "down"):
+        so, st, mom, flow = eng.categories(now, d)
+        c = int(so) + int(bool(mom)) + int(bool(flow))
+        segs.append(("t", f"{dir_label(d)} {c}/3｜结构{'✓' if so else '✗'} 动量{'✓' if mom else '✗'} 资金{'✓' if flow else '✗'}"))
+    run = s["run"]
+    if run and P is not None:
+        mv = pct_change(P, run["start_price"])
+        t = (f"进行中：{dir_label(run['dir'])}（{hm(parse_iso(run['start']))}起，价格 {run['start_price']:.2f}→{P:.2f}，{mv:+.2f}%，已提醒{run['pushes']}次）")
+        if cfg.invalid_v2 and run.get("level") is not None:
+            t += f"｜基准 {run.get('lvl_name', '')} {run['level']:.2f}"
+            if run.get("swing") is not None:
+                t += f"｜{'回落低点' if run['dir'] == 'up' else '反弹高点'} {run['swing']:.2f}"
+            if run.get("weak_sent"):
+                t += "｜已转弱"
+        segs.append(("t", t))
+    evs = s["events"][-5:]
+    if evs:
+        segs.append(("b", "【最近信号】"))
+        for e in reversed(evs):
+            first = e["text"].splitlines()[0]
+            segs.append(("t", f"{hm(parse_iso(e['t']))} {first if len(first) <= 70 else first[:69] + '…'}"))
+    dt_line = eng.data_times_line(now)
+    if dt_line:
+        segs.append(("t", dt_line))
+    caps = v.get("caps") or {}
+    bad = [k for k, val in caps.items() if val]
+    if bad:
+        segs.append(("t", "⚠ 不可用接口：" + "、".join(CAP_LABEL.get(k, k) for k in bad)))
+    segs.append(("t", DISCLAIMER))
+    return HTMLText(render_segs(segs, html=True))
+
+
 def render_panel(eng: Engine, now) -> str:
+    if eng.cfg.fmt_v2:
+        return render_panel_v2(eng, now)
     cfg, s, v = eng.cfg, eng.s, eng.view
     P = v.get("P")
     L = [f"📊 {cfg.symbol} 实时面板 · {hm(now, True)} ET"]
@@ -1969,6 +2780,13 @@ class Fetcher:
                 if items:
                     newest = max(i["tdt"] for i in items)
                     eng.s["flow"]["cursor"] = iso(newest)
+        # 4b) 0DTE 当日买卖权利金汇总（flow-per-expiry）：每 x0_every 秒一次；读不到不影响其它功能（资金块退回"0DTE 大单当日累计"过渡口径）
+        if cfg.flow_v2 and "x0" not in self.disabled and self.due("x0", now, cfg.x0_every):
+            today_et = now.astimezone(ET).date()
+            x = self.fetch("x0", f"/api/stock/{sym}/flow-per-expiry", None, lambda raw: parse_flow_expiry(raw, today_et), now, retries=1)
+            if x is not None:
+                self.cache["x0"] = dict(x, fetched=iso(now))
+        snap["x0"] = self.cache.get("x0") if cfg.flow_v2 else None
         # 5) 每日一次：日度 Gamma、前一交易日 tick 波动基线
         if (eng.s.get("greek") is None) and "greek" not in self.disabled and self.due("greek", now, 600):
             g = self.fetch("greek", f"/api/stock/{sym}/greek-exposure", {"timeframe": "1W"}, parse_greek, now, retries=1)
@@ -1993,6 +2811,8 @@ class Fetcher:
         for k, v in self.disabled.items():
             if k == "strikes":
                 snap["notices"]["cap_strikes"] = f"按行权价的墙位数据不可用（{v}），已改用 UW 自带的 Call/Put Wall（可能离现价较远）；其余功能不受影响。"
+            elif k == "x0":
+                snap["notices"]["cap_x0"] = f"0DTE 当日买卖汇总（flow-per-expiry）读不到（{v}），资金块改用“0DTE 大单当日累计”的过渡口径；其余功能不受影响。"
             else:
                 snap["notices"][f"cap_{k}"] = f"接口 {k} 不可用（{v}），相关信号已停用；其余功能不受影响。"
         return snap
@@ -2012,8 +2832,11 @@ def deliver(cfg: Cfg, tg: Telegram, eng: Engine, now, snap_force: bool = False) 
             remaining.append(item)
             continue
         text = item["text"]
+        if item.get("html"):
+            text = HTMLText(text)                  # 重新加载的状态里只剩普通字符串：按标记还原成 HTML 文本
         if age_m > 1.5:
-            text = f"⏱ 延迟送达（原触发 {hm(parse_iso(item['t']))} ET）\n" + text
+            late = f"⏱ 延迟送达（原触发 {hm(parse_iso(item['t']))} ET）\n"
+            text = (HTMLText(late + text) if item.get("html") else late + text)
         mid = tg.send(text, silent=item["silent"])
         if mid is not None:
             s["counters"]["sent"] += 1
@@ -2597,7 +3420,301 @@ def run_probe_streams(cfg: Cfg, uw, now, sleep=time.sleep) -> tuple:
     return out, shapes
 
 
-def run_probe(cfg: Cfg, uw: UW, tg: Telegram, now_fn=now_et) -> None:
+# ---- 第二批功能的准备检查（只探测、不进监控）：0DTE 买卖汇总的真实形态 / 盘中是否在更新、SPY 股票逐笔成交能否按报价区分买卖、备用的按合约汇总 ----
+OCC_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
+
+
+def parse_occ(sym):
+    """期权代码（如 SPY261121C00720000）→ (标的, 到期日, 'C'/'P', 行权价)；格式不对返回 None。"""
+    m = OCC_RE.match(str(sym or "").strip().upper())
+    if not m:
+        return None
+    try:
+        exp = datetime.strptime(m.group(2), "%y%m%d").date()
+    except ValueError:
+        return None
+    return m.group(1), exp, m.group(3), int(m.group(4)) / 1000.0
+
+
+def next_weekday(d: date) -> date:
+    d += timedelta(days=1)
+    while d.weekday() >= 5:
+        d += timedelta(days=1)
+    return d
+
+
+def truthy(v) -> bool:
+    return v is True or str(v).strip().lower() in ("true", "1", "yes")
+
+
+def nbbo_side(price, bid, ask):
+    """股票成交相对买卖报价（NBBO）的位置：
+    buy=成交价 ≥ 卖一（买方主动）｜sell=成交价 ≤ 买一（卖方主动）｜in_buy / in_sell=价差之内、高于/低于中点｜mid=正好在中点（或报价锁定）｜None=报价缺失/无效（含倒挂）。"""
+    if price is None or bid is None or ask is None or bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    eps = 1e-9
+    if ask - bid < eps:                                    # 报价锁定（买一=卖一）
+        return "mid" if abs(price - bid) < eps else ("buy" if price > ask else "sell")
+    if price >= ask - eps:
+        return "buy"
+    if price <= bid + eps:
+        return "sell"
+    mid = (bid + ask) / 2.0
+    if abs(price - mid) < eps:
+        return "mid"
+    return "in_buy" if price > mid else "in_sell"
+
+
+def tape_rows(raw) -> list:
+    """lit-flow / darkpool 的逐笔成交 → [{t, price, size, bid, ask, prem, canceled}]；读不到价格或数量的行丢弃。"""
+    out = []
+    for r in _data_rows(raw):
+        px, sz = num(r.get("price")), num(r.get("size"))
+        if px is None or sz is None or sz <= 0:
+            continue
+        out.append({"t": _any_ts(r.get("executed_at")) or _any_ts(r.get("timestamp")) or _any_ts(r.get("time")),
+                    "price": px, "size": sz, "bid": num(r.get("nbbo_bid")), "ask": num(r.get("nbbo_ask")),
+                    "prem": num(r.get("premium")), "canceled": truthy(r.get("canceled"))})
+    return out
+
+
+TAPE_CLASSES = (("buy", "主动买(价≥卖一)"), ("sell", "主动卖(价≤买一)"), ("in_buy", "价差内偏买"), ("in_sell", "价差内偏卖"),
+                ("mid", "正中点"), ("na", "无有效报价"))
+
+
+def tape_stats(rows) -> dict:
+    """按 nbbo_side 汇总（已取消的成交不算）：{类别: [笔数, 股数, 金额]}。"""
+    acc = {k: [0, 0.0, 0.0] for k, _ in TAPE_CLASSES}
+    for x in rows:
+        if x["canceled"]:
+            continue
+        a = acc[nbbo_side(x["price"], x["bid"], x["ask"]) or "na"]
+        a[0] += 1
+        a[1] += x["size"]
+        a[2] += x["size"] * x["price"]
+    return acc
+
+
+def probe_tape_lines(raw, now_u=None) -> list:
+    allrows = _data_rows(raw)
+    if not allrows:
+        return ["返回 0 行（结构见字段结构）"]
+    rows = tape_rows(raw)
+    if not rows:
+        return [f"{len(allrows)} 行，但读不到 price / size（字段名可能不同，见字段结构）"]
+    ts = [x["t"] for x in rows if x["t"]]
+    head = f"{len(allrows)} 行（可用 {len(rows)}，已取消 {sum(1 for x in rows if x['canceled'])}）"
+    if ts:
+        head += f"｜{hmd(min(ts))}→{hmd(max(ts))} ET（跨度 {fmt_age((max(ts) - min(ts)).total_seconds())}）"
+        if now_u is not None:
+            head += f"｜最新一笔距现在 {fmt_age((now_u - max(ts)).total_seconds())}"
+    L = [head]
+    st = tape_stats(rows)
+    live_n = sum(v[0] for v in st.values())
+    if live_n == 0:
+        return L + ["全部是已取消的成交"]
+    L.append(f"带有效买卖报价（nbbo_bid / nbbo_ask）：{live_n - st['na'][0]}/{live_n} 笔")
+    sh = sum(v[1] for v in st.values())
+    L.append("按股数占比：" + "｜".join(f"{nm} {100.0 * st[k][1] / sh:.0f}%" for k, nm in TAPE_CLASSES))
+    strict = st["buy"][1] - st["sell"][1]
+    split = strict + st["in_buy"][1] - st["in_sell"][1]
+    L.append(f"净买入：只算 主动买−主动卖 {strict:+,.0f} 股（{money(st['buy'][2] - st['sell'][2], True)}）｜价差内按中点划分后 {split:+,.0f} 股")
+    sizes = sorted(x["size"] for x in rows if not x["canceled"])
+    L.append(f"单笔股数 最小/中位/最大：{sizes[0]:,.0f}/{sizes[len(sizes) // 2]:,.0f}/{sizes[-1]:,.0f}")
+    return L
+
+
+def flow_expiry_lines(raw, today: date):
+    """flow-per-expiry 检查：返回 (报告行, 选中的 0DTE 行或 None)。优先看“今天到期”的那一行（监控实际用的）；
+    没有（休市日 / 盘前）就改看“数据日期当天到期”的那一行，用来核对字段含义。"""
+    rows = _data_rows(raw)
+    top_date = str(raw.get("date") or "")[:10] if isinstance(raw, dict) else ""
+    exps = sorted({str(r.get("expiry"))[:10] for r in rows if r.get("expiry")})
+    dates = sorted({(str(r.get("date") or "")[:10] or top_date) for r in rows} - {""})
+    L = [f"{len(rows)} 个到期日" + (f"｜到期日 {exps[0]}→{exps[-1]}" if exps else "｜行内没有 expiry 字段")
+         + f"｜数据日期 {'、'.join(dates) if dates else (top_date or '读不到')}"]
+    pick, which = parse_flow_expiry(raw, today), "today"
+    if pick is None and dates:
+        try:
+            d0 = date.fromisoformat(dates[-1])
+        except ValueError:
+            d0 = None
+        pick = parse_flow_expiry(raw, d0) if d0 else None
+        which = "dataday"
+    if pick is None:
+        L.append(f"⚠ 找不到“当天到期”的那一行（今天 {today.isoformat()}" + ("，周末休市属正常" if today.weekday() >= 5 else "")
+                 + "），或读不到 买/卖 权利金字段，字段见结构")
+        return L, None
+    if which == "today":
+        L.append("今天到期的 0DTE 行｜" + ("✅ 数据日期就是今天，监控会采用" if pick["ok"] else
+                                          f"⚠ 数据日期是 {pick['date'] or '读不出'}，不是今天 {today.isoformat()}，监控会退回过渡口径"
+                                          "（盘中看到这条，就说明这个汇总不是实时的）"))
+    else:
+        L.append(f"今天（{today.isoformat()}）没有当天到期的行（休市日 / 盘前属正常）；改看数据日 {pick['expiry']} 的 0DTE 行，只用来核对字段含义")
+    L.append(f"买Call {money(pick['ca'])}｜卖Call {money(pick['cb'])}｜买Put {money(pick['pa'])}｜卖Put {money(pick['pb'])}"
+             f"｜Call总额 {money(pick['cv'])}｜Put总额 {money(pick['pv'])}")
+    L.append(f"买方 Call : Put = {ratio_text(pick['ca'], pick['pa'])}｜买−卖 净额 Call {money(pick['ca'] - pick['cb'], True)}、Put {money(pick['pa'] - pick['pb'], True)}")
+    if pick["cv"] <= 0 and pick["pv"] <= 0:
+        L.append("合理性：总额字段（call_premium / put_premium）读不到，跳过“买+卖 ≤ 总额”核对")
+    else:
+        bad = [nm for nm, s, t in (("Call", pick["ca"] + pick["cb"], pick["cv"]), ("Put", pick["pa"] + pick["pb"], pick["pv"])) if t > 0 and s > t * 1.02]
+        L.append("合理性：买+卖 ≤ 总额 " + ("✅" if not bad else f"⚠ {'、'.join(bad)} 超出，字段含义可能和假设不同"))
+    for r in rows:
+        if str(r.get("expiry") or "")[:10] == pick["expiry"]:
+            L.append("该行字段：" + ", ".join(sorted(r.keys())))
+            break
+    return L, pick
+
+
+def flow_expiry_change(a, b, gap, in_session: bool) -> str:
+    """同一接口隔 gap 秒读两次：数值有没有变（盘中变 = 实时更新）。"""
+    if not a or not b:
+        return f"两次读取（间隔 {gap:.0f} 秒）：第二次读不到 0DTE 行，无法比较"
+    changed = [f"{nm} {money(b[k] - a[k], True)}" for k, nm in (("ca", "买Call"), ("cb", "卖Call"), ("pa", "买Put"), ("pb", "卖Put")) if abs(b[k] - a[k]) > 0.5]
+    if changed:
+        return f"两次读取（间隔 {gap:.0f} 秒）：✅ 数值在变（{'；'.join(changed)}）→ 汇总在更新" + ("" if in_session else "（现在不是盘中，请留意数据日期）")
+    return (f"两次读取（间隔 {gap:.0f} 秒）：数值完全没变" +
+            ("→ ⚠ 盘中没变，汇总可能不是实时的（请隔几分钟再跑一次 probe 确认）" if in_session else "（休市/盘外没变属正常；是否实时要在盘中再跑一次 probe）"))
+
+
+def option_contracts_lines(raw, asked: date, official=None, limit: int = 500) -> list:
+    """option-contracts（备用口径）：按合约汇总指定到期日的买/卖量，并和 flow-per-expiry 的汇总对照。"""
+    rows = _data_rows(raw)
+    if not rows:
+        return [f"返回 0 行（请求到期日 {asked.isoformat()}）"]
+    agg = {cp: {"n": 0, "vol": 0.0, "ask": 0.0, "bid": 0.0, "ap": 0.0, "bp": 0.0} for cp in "CP"}
+    exps, bad_sym, have_ask, have_bid = {}, 0, False, False
+    for r in rows:
+        occ = parse_occ(r.get("option_symbol"))
+        if occ is None:
+            bad_sym += 1
+            continue
+        exp, cp = occ[1], occ[2]
+        exps[exp] = exps.get(exp, 0) + 1
+        if exp != asked:                                     # 只汇总请求的那个到期日（参数没生效时，别把其它到期日混进来）
+            continue
+        a = agg[cp]
+        a["n"] += 1
+        a["vol"] += num(r.get("volume")) or 0.0
+        av, bv = num(r.get("ask_volume")), num(r.get("bid_volume"))
+        have_ask, have_bid = have_ask or av is not None, have_bid or bv is not None
+        px = num(r.get("avg_price")) or 0.0
+        a["ask"] += av or 0.0
+        a["bid"] += bv or 0.0
+        a["ap"] += (av or 0.0) * px * 100.0
+        a["bp"] += (bv or 0.0) * px * 100.0
+    L = [f"{len(rows)} 行" + (f"（已达 {limit} 条上限，可能被截断，需要翻页）" if len(rows) >= limit else "") + f"｜请求到期日 {asked.isoformat()}"
+         + (f"｜返回的到期日：{'、'.join(f'{d.isoformat()}×{n}' for d, n in sorted(exps.items())[:4])}" if exps else "｜读不到期权代码（option_symbol）")
+         + (f"｜{bad_sym} 行读不到期权代码" if bad_sym and exps else "")]
+    if exps:
+        L.append("expiry 参数：" + ("✅ 有效（只返回了请求的到期日）" if set(exps) == {asked} else "⚠ 返回了其它到期日，参数可能没生效（若用这个备用口径，需要自己按到期日过滤）"))
+    for cp, nm in (("C", "Call"), ("P", "Put")):
+        a = agg[cp]
+        L.append(f"{nm}：{a['n']} 个合约｜成交量 {a['vol']:,.0f}｜ask侧 {a['ask']:,.0f}｜bid侧 {a['bid']:,.0f}｜估算买方权利金 {money(a['ap'])}｜估算卖方权利金 {money(a['bp'])}")
+    if not (have_ask or have_bid):
+        L.append("⚠ 没找到 ask_volume / bid_volume 字段，无法估算买卖权利金（字段见结构）")
+    else:
+        L.append("估算 = Σ 买/卖量 × 均价 × 100（均价是全天平均成交价，只是粗略近似）")
+    if official and official.get("expiry") == asked.isoformat() and agg["C"]["ap"] > 0 and agg["P"]["ap"] > 0 and official["ca"] > 0 and official["pa"] > 0:
+        L.append(f"对照 flow-per-expiry：买Call 估算/汇总 = {agg['C']['ap'] / official['ca']:.2f}｜买Put = {agg['P']['ap'] / official['pa']:.2f}（越接近 1，备用口径越可用）")
+    return L
+
+
+def run_probe_flow_checks(cfg: Cfg, uw, now, sleep=time.sleep, gap: float = 45.0) -> tuple:
+    """第二批功能的准备检查（只探测，不进监控；每一项单独 try）：
+    ① 0DTE 买卖汇总（flow-per-expiry）能否读到、数据日期是不是今天、盘中数值是否在更新
+    ② SPY 股票逐笔成交（场内 lit-flow、暗池 darkpool）：带不带买卖报价、能否按报价区分买卖、一次能看多久、增量参数是否有效
+    ③ 备用：option-contracts 按合约汇总的 0DTE 买卖量，和 ① 对照。返回 (报告行, 字段结构行)。"""
+    sym = cfg.symbol
+    t_et = now.astimezone(ET)
+    today, now_u = t_et.date(), now.astimezone(UTC)
+    in_session = t_et.weekday() < 5 and is_rth(now)
+    out, shapes, n_ok, n_all, pick = [], [], 0, 0, None
+    # ① 0DTE 买卖汇总
+    name = "0DTE 买卖汇总（flow-per-expiry）"
+    n_all += 1
+    try:
+        path = f"/api/stock/{sym}/flow-per-expiry"
+        r = uw.get(path, None, retries=1)
+        log(f"probe(第二批) {name}: HTTP {r.status} {r.ms}ms")
+        if not r.ok:
+            out.append(f"❌ {name}｜HTTP {r.status}｜{(r.err or '')[:120]}")
+        else:
+            n_ok += 1
+            lines, pick = flow_expiry_lines(r.data, today)
+            out.append(f"✅ {name}｜{lines[0]}")
+            out.extend(f"   {x}" for x in lines[1:])
+            if pick:
+                sleep(gap)
+                r2 = uw.get(path, None, retries=1)
+                second = parse_flow_expiry(r2.data, date.fromisoformat(pick["expiry"])) if r2.ok else None
+                out.append("   " + flow_expiry_change(pick, second, gap, in_session))
+            shapes.append(f"▸ {name}\n   结构：{shape(r.data)[:500]}")
+    except Exception as e:  # noqa: BLE001
+        out.append(f"⚠ {name} 检查异常 {type(e).__name__}")
+    # ② SPY 股票逐笔成交（场内 / 暗池）
+    for name, path in ((f"{sym} 场内逐笔成交（lit-flow）", f"/api/lit-flow/{sym}"), (f"{sym} 暗池逐笔成交（darkpool）", f"/api/darkpool/{sym}")):
+        n_all += 1
+        try:
+            r = uw.get(path, {"limit": 500}, retries=1)
+            sleep(0.3)
+            log(f"probe(第二批) {name}: HTTP {r.status} {r.ms}ms")
+            if not r.ok:
+                out.append(f"❌ {name}｜HTTP {r.status}｜{(r.err or '')[:120]}")
+                continue
+            n_ok += 1
+            lines = probe_tape_lines(r.data, now_u)
+            out.append(f"✅ {name}｜{lines[0]}")
+            out.extend(f"   {x}" for x in lines[1:])
+            ts = [x["t"] for x in tape_rows(r.data) if x["t"]]
+            if ts:                                                   # 增量参数：监控以后只想取“最近几分钟”的新成交
+                cutoff = max(ts) - timedelta(minutes=5)
+                r2 = uw.get(path, {"limit": 500, "newer_than": int(cutoff.timestamp())}, retries=1)
+                sleep(0.3)
+                if r2.ok:
+                    its = [x["t"] for x in tape_rows(r2.data) if x["t"]]
+                    okf = bool(its) and all(t >= cutoff - timedelta(seconds=2) for t in its)
+                    out.append(f"   {'✅' if okf else '⚠'} newer_than 增量参数｜返回 {len(its)} 笔｜"
+                               + ("全部晚于截止时间，过滤有效" if okf else "含更早的记录或没有返回，过滤可能无效"))
+                else:
+                    out.append(f"   ❌ newer_than 增量参数｜HTTP {r2.status}｜{(r2.err or '')[:100]}")
+            shapes.append(f"▸ {name}\n   结构：{shape(r.data)[:500]}")
+        except Exception as e:  # noqa: BLE001
+            out.append(f"⚠ {name} 检查异常 {type(e).__name__}")
+    # ③ 备用：按合约汇总的 0DTE 买卖量
+    name = "按合约汇总的 0DTE 买卖量（option-contracts，备用口径）"
+    n_all += 1
+    try:
+        path = f"/api/stock/{sym}/option-contracts"
+        cands = [today, next_weekday(today)] if t_et.weekday() < 5 else [prev_weekdays(today, 1)[0], next_weekday(today)]
+        got, fail = None, None
+        for d in cands:
+            r = uw.get(path, {"expiry": d.isoformat(), "limit": 500, "exclude_zero_dte": "false"}, retries=1)
+            sleep(0.3)
+            log(f"probe(第二批) {name} expiry={d}: HTTP {r.status} {r.ms}ms")
+            if not r.ok:
+                fail = f"HTTP {r.status}｜{(r.err or '')[:120]}"
+                break
+            if _data_rows(r.data):
+                got = (d, r)
+                break
+        if got is None:
+            out.append(f"❌ {name}｜{fail or '请求的到期日都没有返回合约（' + '、'.join(x.isoformat() for x in cands) + '）'}")
+        else:
+            n_ok += 1
+            d, r = got
+            lines = option_contracts_lines(r.data, d, pick)
+            out.append(f"✅ {name}｜{lines[0]}")
+            out.extend(f"   {x}" for x in lines[1:])
+            shapes.append(f"▸ {name}\n   结构：{shape(r.data)[:500]}")
+    except Exception as e:  # noqa: BLE001
+        out.append(f"⚠ {name} 检查异常 {type(e).__name__}")
+    out.insert(0, f"🧪 第二批功能准备检查（0DTE 买卖汇总 / 股票成交方向 / 备用合约汇总）｜{n_ok}/{n_all} 项可用｜运行时刻 {t_et.strftime('%a %m-%d %H:%M')} ET"
+                  + ("（盘中）" if in_session else "（非盘中：只能核对接口和字段，是否实时要在盘中再跑一次）"))
+    return out, shapes
+
+
+def run_probe(cfg: Cfg, uw: UW, tg: Telegram, now_fn=now_et, sleep=time.sleep) -> None:
     now = now_fn()
     sym = cfg.symbol
     today = now.astimezone(ET).date()
@@ -2715,11 +3832,17 @@ def run_probe(cfg: Cfg, uw: UW, tg: Telegram, now_fn=now_et) -> None:
     except Exception as e:  # noqa: BLE001
         lines_ok.append(f"⚠ 扩展接口检查异常 {type(e).__name__}")
     try:
-        ok_l, shape_l = run_probe_streams(cfg, uw, now)
+        ok_l, shape_l = run_probe_streams(cfg, uw, now, sleep=sleep)
         lines_ok.extend(ok_l)
         lines_shape.extend(shape_l)
     except Exception as e:  # noqa: BLE001
         lines_ok.append(f"⚠ 新数据流检查异常 {type(e).__name__}")
+    try:
+        ok_f, shape_f = run_probe_flow_checks(cfg, uw, now, sleep=sleep)
+        lines_ok.extend(ok_f)
+        lines_shape.extend(shape_f)
+    except Exception as e:  # noqa: BLE001
+        lines_ok.append(f"⚠ 第二批准备检查异常 {type(e).__name__}")
     lim = getattr(uw, "limits", None) or {}
     lim_t = (f"额度头：limit={lim.get('limit')} count={lim.get('count')}" if lim
              else "额度头：无（符合 Basic 套餐“无每日请求上限”）")
@@ -2744,7 +3867,109 @@ def run_probe(cfg: Cfg, uw: UW, tg: Telegram, now_fn=now_et) -> None:
             log("探测报告发送失败：", tg.last_error)
 
 
-def run_tgtest(cfg: Cfg, tg: Telegram, sleep=time.sleep) -> None:
+SAMPLE_TAG = "【样张·示意数据，非真实信号】"
+
+
+def sample_messages(cfg: Cfg, now) -> list:
+    """telegram-test 用的新版面样张：返回 [(名称, 文本)]。数字是示意的（不是真实行情）；每条末尾都带"样张"标注。
+    样张走的就是真实提醒用的版面代码，所以它也是一次"版面代码在真实 Telegram 上能不能正常显示"的检查。"""
+    today = now.astimezone(ET).strftime("%Y-%m-%d")
+    prim = {"call": 725.0, "put": 720.0, "magnet": 722.0, "flip": 718.5, "call_max": 730.0, "put_max": 715.0, "pins": [],
+            "time": now - timedelta(seconds=40)}
+
+    def t_ago(mins):
+        return now - timedelta(minutes=mins)
+
+    def engine(P, side="below", events=(), start_px=721.2, flat_min=14.0, wall_src="strike"):
+        e = Engine(cfg, new_state(today))
+        x0 = {"ok": True, "date": today, "expiry": today, "ca": 4_800_000.0, "cb": 1_100_000.0, "pa": 9_600_000.0, "pb": 900_000.0,
+              "cv": 0.0, "pv": 0.0, "fetched": iso(now - timedelta(seconds=25))}
+        tide = {"S": 3_100_000.0, "z": 1.8, "ncp_win": 1_800_000.0, "npp_win": 3_500_000.0, "last": now - timedelta(seconds=20)}
+        e.view = {"P": P, "prim": prim, "live": prim, "price_age": 2.0, "wall_src": wall_src, "closed": False, "stale": False,
+                  "force": False, "caps": {}, "tide": tide, "prints": None, "sigma1m": None, "x0": x0, "tide_day": None}
+        e.s["zone"].update(last={"center": 718.5, "lo": 718.2, "hi": 718.8}, side=side)
+        e.s["session"].update(open=720.6, high=721.9, low=min(P, 716.7), first_t=iso(t_ago(130)), was_regular=True)
+        # 最近 30 分钟的价格样本：前一段横盘，之后走到现价（给"10/20 分钟变化"用）
+        ph = []
+        for k in range(120):
+            mins = 30.0 - k * 0.25
+            f = 0.0 if mins >= flat_min else (flat_min - mins) / flat_min
+            ph.append([(now - timedelta(minutes=mins)).timestamp(), round(start_px + (P - start_px) * f, 3)])
+        e.s["px_hist"] = ph
+        for mins, kind, d, text, px, extra in sorted(events, key=lambda x: -x[0]):      # 按时间先后写入
+            e.add_event(t_ago(mins), kind, d, text, px, **extra)
+        return e
+
+    flip_ev = (7, "flip_cross", "down", "Flip区向下穿越已确认", 718.4, {"n": 1, "prev_ago": None, "held": 62, "level": 718.5})
+    wall_ev = (9, "wall_break", "down", "Put Wall 720.00 向下跌破已确认", 719.5, {"n": 1, "prev_ago": None, "held": 48, "level": 720.0, "chop": False})
+    fm_ev = (3, "fastmove", "down", "快速下杀 -2.50（10分钟内 719.90→717.40，阈值 ±2.00）", 717.4,
+             {"n": 2, "first_t": iso(t_ago(8)), "first_px": 720.4, "cum": -3.0, "move": -2.5, "ref": 719.9, "thr": 2.0})
+    whale_ev = (1.5, "mega", "down", "0DTE BUY PUT 717 $1.2M｜主动买入(ask侧)→偏空", 717.0,
+                {"prem": 1_200_000.0, "side": "ask", "typ": "put", "strike": 717.0, "dte": 0, "delta": -0.45, "iv": 0.139})
+    P = 716.80
+    base = engine(P, events=(flip_ev, wall_ev, fm_ev, whale_ev))
+    base.s["broken"]["put"] = {"level": 720.0, "t": iso(t_ago(9)), "chop": False, "n": 1}
+    base.s["fm"] = {"dir": "down", "n": 2, "first_t": iso(t_ago(8)), "first_px": 720.4, "last_px": 717.4, "last_t": iso(t_ago(3)), "thr": 2.0}
+    base.s["run"] = {"dir": "down", "start": iso(t_ago(9)), "start_price": 719.5, "last_push": iso(t_ago(9)), "last_price": 719.5, "tier": 2,
+                     "pushes": 1, "extreme": 716.7, "anchored": True, "level": 718.2, "lvl_name": "Flip区", "origin": 721.2, "swing": 719.6,
+                     "zz": {"ext": 716.8, "ret": 716.8}}
+    out = []
+
+    def add(name, fn):
+        try:
+            out.append((name, HTMLText(f"{fn()}\n{esc(SAMPLE_TAG)}") if cfg.fmt_v2 else f"{fn()}\n{SAMPLE_TAG}"))
+        except Exception as ex:  # noqa: BLE001  样张出错也要让你看到原因，而不是整个测试中断
+            out.append((name, f"⚠ 样张「{name}」生成失败：{type(ex).__name__}: {safe(str(ex))[:160]}"))
+
+    so, st, mom, flow = base.categories(now, "down")
+    add("共振", lambda: base.build_confluence(now, P, "down", so, st, mom, flow, 3, "new", None))
+    def fastmove_3rd():
+        saved = base.s["fm"]
+        base.s["fm"] = {"dir": "down", "n": 3, "first_t": iso(t_ago(12)), "first_px": 721.4, "last_px": P, "last_t": iso(now), "thr": 2.1}
+        try:
+            return base.build_fastmove(now, P, {"dir": "down", "n": 3, "first_t": iso(t_ago(12)), "first_px": 721.4, "cum": -4.6,
+                                                "move": -2.4, "ref": 719.2, "thr": 2.1})
+        finally:
+            base.s["fm"] = saved
+    add("快速异动·第3次", fastmove_3rd)
+    first = engine(719.35, events=((0.5, "wall_break", "down", "Put Wall 720.00 向下跌破已确认", 719.4,
+                                    {"n": 1, "prev_ago": None, "held": 52, "level": 720.0, "chop": False}),), flat_min=6.0, start_px=721.0)
+    first.s["broken"]["put"] = {"level": 720.0, "t": iso(now), "chop": False, "n": 1}
+    add("结构事件·首次破位（响铃）", lambda: first.build_struct(now, 719.35, {"dir": "down", "kind": "wall_break", "level": 720.0, "n": 1,
+                                                                        "prev_ago": None, "held": 52, "text": "Put Wall 720.00 向下跌破已确认"}))
+    rep = engine(719.30, events=((0.5, "wall_break", "down", "Put Wall 720.00 向下跌破已确认", 719.3,
+                                  {"n": 2, "prev_ago": 12.0, "held": 47, "level": 720.0, "chop": False}),), flat_min=6.0, start_px=720.8)
+    rep.s["broken"]["put"] = {"level": 720.0, "t": iso(now), "chop": False, "n": 2}
+    add("结构事件·同位置再次破位（静音）", lambda: rep.build_struct(now, 719.30, {"dir": "down", "kind": "wall_break", "level": 720.0, "n": 2,
+                                                                          "prev_ago": 12.0, "held": 47, "text": "Put Wall 720.00 向下跌破已确认"}))
+    add("0DTE 巨额单·买方（响铃）", lambda: base.build_whale(now, P, {"dir": "down", "side": "ask", "iv": 0.139, "delta": -0.45,
+                                                                  "text": "0DTE BUY PUT 717 $1.2M｜主动买入(ask侧)→偏空"}))
+    run = {"dir": "down", "level": 718.2, "lvl_name": "Flip区", "start": iso(t_ago(31)), "start_price": 718.4, "pushes": 2, "swing": 721.2}
+    weak = engine(720.30, side="above", events=(), start_px=716.9, flat_min=12.0)
+    add("信号转弱（静音）", lambda: weak.build_weak(now, 720.30, dict(run)))
+    add("信号失效（响铃）", lambda: weak.build_invalid(now, 720.40, dict(run), "价格回到 Flip区 718.20 的上方已超过 10 分钟（突破失败）"))
+
+    def fallback_funds():
+        e = engine(P, events=())
+        e.view["x0"] = None
+        e.view["tide"] = {"ncp_win": 1_800_000.0, "npp_win": 3_500_000.0}
+        e.s["flow"]["day0"] = {"buy_call": [3_100_000.0, 6], "buy_put": [5_400_000.0, 9], "sell_call": [900_000.0, 2], "sell_put": [1_200_000.0, 3]}
+        e.s["flow"]["last0"] = [{"t": iso(t_ago(4)), "side": "ask", "type": "put", "strike": 717.0, "prem": 640_000.0, "sign": -1},
+                                {"t": iso(t_ago(2)), "side": "ask", "type": "put", "strike": 716.0, "prem": 410_000.0, "sign": -1}]
+        return e.v2_build(now, P, "📐 资金块样张（UW 的 0DTE 汇总读不到时显示这个）", "过渡口径：0DTE 大单当日累计 + 全到期近 10 分钟净额", blocks=("flow",))
+    add("资金块·过渡口径", fallback_funds)
+    add("实时面板", lambda: render_panel_v2(base, now) if cfg.fmt_v2 else render_panel(base, now))
+    fm_more = ((14, "fastmove", "down", "快速下杀 -2.10", 719.3, {"n": 1, "first_t": iso(t_ago(14)), "first_px": 721.4, "cum": -2.1, "move": -2.1, "ref": 721.4, "thr": 2.0}),
+               (11, "fastmove", "down", "快速下杀 -4.20", 717.2, {"n": 2, "first_t": iso(t_ago(14)), "first_px": 721.4, "cum": -4.2, "move": -4.2, "ref": 721.4, "thr": 2.0}))
+    close = engine(P, events=(flip_ev, wall_ev, fm_ev, whale_ev) + fm_more)
+    close.s["counters"].update(k_conf=1, k_fastmove=3, k_single=1, k_mega=1, pushed=6, silent=3)
+    close.s["greek"] = {"net": -2_980_000.0, "ratio": -0.14, "date": today}
+    close.view["tide_day"] = {"ncp": 18_400_000.0, "npp": 31_200_000.0}
+    add("收盘摘要", lambda: close.build_close_digest(now))
+    return out
+
+
+def run_tgtest(cfg: Cfg, tg: Telegram, sleep=time.sleep, now_fn=now_et) -> None:
     mid = tg.send("✅ UW 监控 · Telegram 推送测试\n这条消息稍后会被自动编辑（模拟“实时面板”原地刷新）。", silent=False)
     if mid is None:
         log("发送失败：", tg.last_error)
@@ -2753,6 +3978,22 @@ def run_tgtest(cfg: Cfg, tg: Telegram, sleep=time.sleep) -> None:
     r = tg.edit(mid, "✅ UW 监控 · Telegram 推送测试\n这条消息已被编辑 → 面板“原地刷新”功能正常。")
     log("编辑结果：", r)
     tg.send("🔕 这是一条静音消息（应当没有提示音）", silent=True)
+    if cfg.fmt_v2:
+        samples = sample_messages(cfg, now_fn())
+        tg.send(f"📐 接下来 {len(samples)} 条是「新版面」样张：数字是示意的、不是真实信号，全部静音。"
+                f"请看：①五个价位是否一行一个、数字列对齐；②第 1 行标题、第 2 行一句话结论；③结构 / 资金 / 动量三块。"
+                f"最后还有 1 条“排版退回”测试。", silent=True)
+        for name, text in samples:
+            sleep(1.2)
+            if tg.send(text, silent=True) is None:
+                log(f"样张「{name}」发送失败：", tg.last_error)
+        sleep(1.2)
+        # 故意写错标记：Telegram 会拒收这条排版，程序应自动退回纯文字再发一次（这就是真实提醒遇到排版问题时的保险）
+        tg.send(HTMLText("<b>排版退回测试</b>\n<pre>这条消息的排版标记故意写错了（有一个标签没有闭合）。\n"
+                         "如果你看到的是普通文字（没有粗体、没有等宽）→ “被拒收时自动退回纯文字”工作正常。\n"
+                         "如果显示成了粗体 → Telegram 容忍了这个错误，也没有问题。\n<b>这个粗体标签故意不闭合"), silent=True)
+    else:
+        tg.send("（FMT_V2=0：新版面已关闭，不发送样张。）", silent=True)
     log("测试完成。")
 
 
