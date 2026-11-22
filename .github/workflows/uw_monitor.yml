@@ -8,13 +8,15 @@ name: UW SPY Monitor
 #      网址：https://api.github.com/repos/<你的用户名>/<仓库名>/actions/workflows/uw_monitor.yml/dispatches
 #   2) 下面的 schedule 是 GitHub 自带定时器，只作“万一 cron-job.org 失效”的兜底（可能延迟几分钟）
 #   3) 在 Actions 页面手动 Run workflow，可选 mode：monitor / probe / telegram-test / backtest
+#      telegram-test = 测试 Telegram 推送，并把“新版面样张”（示意数据，每条都带样张标注）发到你的 Telegram，用来检查手机上的排版
+#      probe = 探测 UW 接口；新增“第二批功能准备检查”（0DTE 买卖汇总 / 股票成交买卖方向 / 备用合约汇总），盘中跑一次最有用，约需 2～3 分钟
 #      backtest = 提醒回测：用 UW 的 1 分钟行情，把历史提醒“按提醒时间入局”重算一遍，结果发到 Telegram（不影响监控状态）
 # 两个触发源同时存在也没问题：concurrency 保证同一时间只有 1 个监控任务在跑，多出来的排队任务会被自动取消。
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "运行模式：monitor=正常监控｜probe=探测 UW 接口并发到 Telegram｜telegram-test=只测试 Telegram 推送｜backtest=提醒回测（结果发到 Telegram）"
+        description: "运行模式：monitor=正常监控｜probe=探测 UW 接口并发到 Telegram（含新增的 0DTE 汇总 / 股票成交方向检查，盘中跑最有用）｜telegram-test=测试 Telegram 推送并发送新版面样张（示意数据）｜backtest=提醒回测（结果发到 Telegram）"
         type: choice
         options:
           - monitor
@@ -81,6 +83,35 @@ jobs:
           IMPULSE_PCT: ${{ vars.IMPULSE_PCT }}
           FLIP_BUFFER: ${{ vars.FLIP_BUFFER }}
           WALL_BUFFER: ${{ vars.WALL_BUFFER }}
+          # 2026-11 提醒改版（v2）：每一项改动都有总开关，在 Variables 里新建同名变量并设为 0，就立刻回到旧行为（不用改代码）：
+          #   FMT_V2=新版面（五点位梯子 + 结构/资金/动量）｜INVALID_V2=“转弱→失效”两级｜FASTMOVE=快速异动提醒
+          #   LOUD_TIERS=分级响铃 + 同位置合并｜WHALE_0DTE_ONLY=巨额单只看 0DTE｜FLOW_V2=资金块用 0DTE 口径
+          FMT_V2: ${{ vars.FMT_V2 }}
+          INVALID_V2: ${{ vars.INVALID_V2 }}
+          FASTMOVE: ${{ vars.FASTMOVE }}
+          LOUD_TIERS: ${{ vars.LOUD_TIERS }}
+          WHALE_0DTE_ONLY: ${{ vars.WHALE_0DTE_ONLY }}
+          FLOW_V2: ${{ vars.FLOW_V2 }}
+          # v2 的可调参数（不建就用默认值）：转弱缓冲 0.2%（价格收回突破位多少）、站稳 180 秒；失效：收复突破位持续 10 分钟，或破最近一次回落低点/反弹高点站稳 60 秒
+          WEAK_BUFFER_PCT: ${{ vars.WEAK_BUFFER_PCT }}
+          WEAK_HOLD_SECONDS: ${{ vars.WEAK_HOLD_SECONDS }}
+          INVALID_HOLD_MIN: ${{ vars.INVALID_HOLD_MIN }}
+          SWING_MIN_PCT: ${{ vars.SWING_MIN_PCT }}
+          SWING_CONFIRM_SECONDS: ${{ vars.SWING_CONFIRM_SECONDS }}
+          # 快速异动：10 分钟内走出 ≥ max(最小幅度, 倍数×近期波动)；每日响铃上限 30；其它每类提醒每日响铃上限 10；同一位置 30 分钟内再次突破静音
+          FASTMOVE_MINUTES: ${{ vars.FASTMOVE_MINUTES }}
+          FASTMOVE_MIN_USD: ${{ vars.FASTMOVE_MIN_USD }}
+          FASTMOVE_SIGMA_MULT: ${{ vars.FASTMOVE_SIGMA_MULT }}
+          FASTMOVE_CAP: ${{ vars.FASTMOVE_CAP }}
+          LOUD_TYPE_CAP: ${{ vars.LOUD_TYPE_CAP }}
+          SAME_LEVEL_MERGE_MIN: ${{ vars.SAME_LEVEL_MERGE_MIN }}
+          # 版面与 0DTE 大单：离现价超过 FAR_PCT(%) 标“远”；事件超过 OLD_EVENT_MIN 分钟标“旧”；0DTE 巨额单门槛；0DTE 大单同向合计门槛 / 最少笔数；UW 0DTE 汇总的刷新间隔
+          FAR_PCT: ${{ vars.FAR_PCT }}
+          OLD_EVENT_MIN: ${{ vars.OLD_EVENT_MIN }}
+          WHALE_0DTE_MIN: ${{ vars.WHALE_0DTE_MIN }}
+          PRINT_BURST_0DTE: ${{ vars.PRINT_BURST_0DTE }}
+          PRINT_COUNT_0DTE: ${{ vars.PRINT_COUNT_0DTE }}
+          X0_EVERY_SECONDS: ${{ vars.X0_EVERY_SECONDS }}
           # 回测专用（只在 mode=backtest 时用到）：滑点（美元/张，默认 0.03）、入场延迟（分钟，默认 0）、大单分类回测天数（默认 5，0=不做）
           BT_SLIPPAGE: ${{ vars.BT_SLIPPAGE }}
           BT_DELAY_MIN: ${{ vars.BT_DELAY_MIN }}
